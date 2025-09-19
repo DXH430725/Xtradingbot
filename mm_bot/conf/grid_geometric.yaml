@@ -1,0 +1,35 @@
+general:
+  log_config: mm_bot/conf/logging.yaml
+  log_dir: logs
+  tick_size: 2.0
+  # Optional global symbol default
+  # symbol: BTC_USDT_Perp
+  # connector: lighter  # or grvt
+
+connector:
+  base_url: https://mainnet.zklighter.elliot.ai
+  keys_file: Lighter_key.txt
+  account_index: null
+  rpm: 4000
+
+strategy:
+  name: grid_geometric
+  grid_geometric:
+    # Optional per-strategy override symbol (takes precedence over general.symbol)
+    # symbol: BTC_USDT_Perp
+    # Mode: neutral | long | short
+    mode: neutral
+    range_low: 50000.0
+    range_high: 70000.0
+    levels: 20
+    orders_per_side: 5
+    # Total quote allocation for grid sizing (optional). If omitted, use min order size.
+    # quote_allocation: 1000.0
+    post_only: 1
+    # By default, the grid is fixed and does not re-center when price moves.
+    # If you prefer re-centering behavior, set recenter_on_move: 1 and configure requote_ticks.
+    recenter_on_move: 0
+    requote_ticks: 2
+    telemetry_enabled: 0
+    # telemetry_url: "http://127.0.0.1:5000/ingest/Grid01"
+    telemetry_interval_secs: 30

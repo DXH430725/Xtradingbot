@@ -1,0 +1,41 @@
+# OS / editors
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# Logs and temps
+logs/
+*.log
+temp.txt
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Env and secrets
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*secret*
+*_key.txt
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+
+# Node/JS (if present)
+node_modules/
+
+# Misc
+-

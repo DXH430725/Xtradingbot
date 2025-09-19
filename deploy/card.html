@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>Bot Telemetry Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root{
+      --bg:#0b1220; --card:#121a2b; --muted:#8ea0c2; --ok:#19c37d; --warn:#ffb020; --mid:#ff884d; --bad:#ff5c5c; --text:#e9eefb; --acc:#5aa8ff; --bar:#1b2740;
+    }
+    body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Helvetica Neue',Arial;color:var(--text);background:linear-gradient(180deg,#0a0f1c, #0b1220);}    
+    header{padding:20px 24px;border-bottom:1px solid rgba(255,255,255,.06);display:flex;justify-content:space-between;align-items:center}
+    h1{margin:0;font-size:18px;letter-spacing:.3px}
+    .pill{font-size:12px;padding:6px 10px;border-radius:999px;background:rgba(90,168,255,.12);color:var(--acc);border:1px solid rgba(90,168,255,.25)}
+    main{max-width:1200px;margin:24px auto;padding:0 16px}
+    .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px}
+    .card{background:var(--card);border:1px solid rgba(255,255,255,.08);border-radius:14px;box-shadow:0 4px 14px rgba(0,0,0,.35);overflow:hidden}
+    .card-hd{display:flex;justify-content:space-between;align-items:center;padding:14px 14px;border-bottom:1px solid rgba(255,255,255,.06)}
+    .name{font-weight:600}
+    .status{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted)}
+    .dot{display:inline-flex;width:10px;height:10px;border-radius:50%}
+    .ok{background:var(--ok)} .bad{background:var(--bad)}
+    .card-bd{padding:14px}
+    .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:6px 0}
+    .kv{flex:1 1 120px;color:var(--muted);font-size:12px}
+    .kv b{color:var(--text);font-size:14px}
+    .mono{font-variant-numeric:tabular-nums; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;}
+    .bar{position:relative;height:12px;background:var(--bar);border-radius:999px;overflow:hidden}
+    .bar > span{position:absolute;left:0;top:0;bottom:0;width:0;border-radius:999px}
+    .tag{display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid rgba(255,255,255,.12);font-size:12px;color:#cfe0ff;background:rgba(255,255,255,.04)}
+    .label{font-size:12px;color:var(--muted)}
+    .updated{font-size:12px;color:var(--muted);padding:0 14px 12px;text-align:right}
+    footer{color:var(--muted);font-size:12px;text-align:center;margin:14px 0}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Bot Telemetry Dashboard</h1>
+    <div class="pill">Live</div>
+  </header>
+  <main>
+    <div class="updated">最后更新：<span id="last-updated">—</span></div>
+    <div id="grid" class="grid"></div>
+  </main>
+  <footer>自托管 · 仅出站上报 · Token 鉴权</footer>
+
+  <script>
+    const grid = document.getElementById('grid');
+    const updated = document.getElementById('last-updated');
+
+    function fmtAgo(ms){
+      const s = Math.floor(ms/1000);
+      if(s<60) return `${s}s`;
+      const m = Math.floor(s/60);
+      if(m<60) return `${m}m`;
+      const h = Math.floor(m/60);
+      return `${h}h`;
+    }
+    function clamp(n, min, max){ return Math.max(min, Math.min(max, n)); }
+    function utilInfo(pos, maxPos){
+      const num = x => (x===null||x===undefined||x!==x) ? null : Number(x);
+      const p = num(pos); const m = num(maxPos);
+      if(m === null || m <= 0 || p === null){
+        return { pct: null, text: '未知', color: 'var(--muted)' };
+      }
+      const pct = clamp((p / m) * 100, 0, 100);
+      if (pct < 30) return { pct, text: '良好', color: 'var(--ok)' };
+      if (pct < 60) return { pct, text: '积压', color: 'var(--warn)' };
+      if (pct < 90) return { pct, text: '严重挤压', color: 'var(--mid)' };
+      return { pct, text: '极端库存', color: 'var(--bad)' };
+    }
+    function numFmt(v){
+      if(v===null||v===undefined||v!==v) return '—';
+      const n = Number(v);
+      if (!isFinite(n)) return String(v);
+      if (Math.abs(n) >= 1000000) return n.toLocaleString(undefined,{notation:'compact',maximumFractionDigits:2});
+      return n.toLocaleString(undefined,{maximumFractionDigits:6});
+    }
+    function card(b){
+      const p = b.payload || {};
+      const dotCls = b.online ? 'ok' : 'bad';
+      const statusTxt = b.online ? '在线' : '离线';
+      const u = utilInfo(p.position_base, p.max_position_base);
+      const pctText = u.pct===null ? '—' : `${u.pct.toFixed(0)}%`;
+      const upn = numFmt(p.pnl_unrealized);
+      const bal = numFmt(p.balance_total);
+      const lat = p.latency_ms==null? '—' : `${Math.round(p.latency_ms)}ms`;
+      const ago = fmtAgo(b.last_update_ms_ago);
+      return `
+      <div class="card">
+        <div class="card-hd">
+          <div class="name">${b.name}</div>
+          <div class="status"><span class="dot ${dotCls}"></span>${statusTxt} · ${ago}前</div>
+        </div>
+        <div class="card-bd">
+          <div class="row">
+            <span class="tag">${p.symbol ?? '—'}</span>
+            <span class="tag">方向：${p.direction ?? '—'}</span>
+            <span class="tag">TP：${p.tp_active ?? '—'}</span>
+            <span class="tag">延时：${lat}</span>
+          </div>
+          <div class="row">
+            <div class="kv">仓位：<b class="mono">${numFmt(p.position_base)}</b></div>
+            <div class="kv">最大仓位：<b class="mono">${numFmt(p.max_position_base)}</b></div>
+          </div>
+          <div class="row">
+            <div style="flex:1">
+              <div class="label">仓位占用（${u.text} · ${pctText}）</div>
+              <div class="bar" aria-label="utilization"><span style="width:${u.pct??0}%; background:${u.color}"></span></div>
+            </div>
+          </div>
+          <div class="row">
+            <div class="kv">未实现PnL：<b class="mono">${upn}</b></div>
+            <div class="kv">余额/权益：<b class="mono">${bal}</b></div>
+          </div>
+        </div>
+      </div>`;
+    }
+    async function refresh(){
+      try{
+        const res = await fetch('/api/status', { cache: 'no-store' });
+        const data = await res.json();
+        updated.textContent = new Date(data.now).toLocaleString();
+        if(!data.bots || !data.bots.length){
+          grid.innerHTML = `<div class="card"><div class="card-bd">暂无上报数据</div></div>`;
+          return;
+        }
+        grid.innerHTML = data.bots.map(card).join('');
+      }catch(e){
+        grid.innerHTML = `<div class="card"><div class="card-bd">拉取失败：${e}</div></div>`;
+      }
+    }
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>
+

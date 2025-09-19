@@ -1,0 +1,12 @@
+root@VM-12-3-ubuntu:~# cd /BOTV2
+root@VM-12-3-ubuntu:/BOTV2# python3 -m venv v2env
+root@VM-12-3-ubuntu:/BOTV2# source v2env/bin/activate
+
+cd /MMBOT
+nohup /MMBOT/.venv/bin/python -u /MMBOT/mm_bot/bin/run_trend_ladder.py >> /MMBOT/logs/run.log 2>&1 & pid=$!; echo $pid > /MMBOT/lighter1.pid; disown $pid
+
+kill -TERM $(cat /MMBOT/lighter1.pid)
+
+ps aux | grep run_as_model.py
+ps aux | grep run_trend_ladder.py
+
