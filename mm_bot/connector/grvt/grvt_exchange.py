@@ -6,6 +6,9 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from mm_bot.connector.base import BaseConnector
+from mm_bot.execution.orders import OrderState, TrackingLimitOrder, TrackingMarketOrder
+
 # Ensure local SDK path is importable (clone to repo root as "grvt-pysdk")
 def _ensure_grvt_on_path(root: str):
     sdk_root = os.path.join(root, "grvt-pysdk")
@@ -36,13 +39,14 @@ class GrvtConfig:
     # add more fields as needed (keys file, account info, rpm, etc.)
 
 
-class GrvtConnector:
+class GrvtConnector(BaseConnector):
     """
     Skeleton connector for GRVT SDK with a Lighter-compatible interface surface.
     Fill in real REST/WS calls using grvt-pysdk.
     """
 
     def __init__(self, config: Optional[GrvtConfig] = None, debug: bool = False):
+        super().__init__("grvt", debug=debug)
         self.config = config or GrvtConfig()
         self.debug = debug
 
@@ -117,6 +121,12 @@ class GrvtConnector:
         on_trade: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_position_update: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> None:
+        super().set_event_handlers(
+            on_order_filled=on_order_filled,
+            on_order_cancelled=on_order_cancelled,
+            on_trade=on_trade,
+            on_position_update=on_position_update,
+        )
         self._on_order_filled = on_order_filled
         self._on_order_cancelled = on_order_cancelled
         self._on_trade = on_trade

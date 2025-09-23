@@ -78,6 +78,9 @@ Conventions
   - Connector: `start(core)`, `stop(core)`, optional `async cancel_all(timeout)`
 - Debug logging: prefer `core.dbg("message")`; INFO-level for main lifecycle only.
 
+Terminology
+- 跟踪限价 (tracking limit): submit a limit order at best bid/ask and, if unfilled, cancel/repost every 10s at the refreshed top of book.
+
 Immediate Next Steps (TODO)
 - Add `event_bus.py` and minimal `data_type.py` (Order/Fill structures).
 - Scaffold `strategy/strategy_base.py` and `strategy/market_making.py` with simple quoting loop.

@@ -10,6 +10,8 @@ from typing import Any, Deque, Dict, List, Optional, Tuple, Callable
 
 from mm_bot.utils.throttler import RateLimiter, lighter_default_weights
 from .lighter_auth import load_keys_from_file
+from mm_bot.connector.base import BaseConnector
+from mm_bot.execution.orders import OrderState, TrackingLimitOrder, TrackingMarketOrder
 
 
 def _ensure_lighter_on_path(root: str):
@@ -35,8 +37,9 @@ class LighterConfig:
     rpm: int = int(os.getenv("XTB_LIGHTER_RPM", "4000"))  # 60 for standard, 4000 for premium
 
 
-class LighterConnector:
+class LighterConnector(BaseConnector):
     def __init__(self, config: Optional[LighterConfig] = None, debug: bool = False):
+        super().__init__("lighter", debug=debug)
         self.config = config or LighterConfig()
         self.debug = debug
         self.log = logging.getLogger("mm_bot.connector.lighter")
@@ -251,10 +254,12 @@ class LighterConnector:
         on_trade: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_position_update: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> None:
-        self._on_order_filled = on_order_filled
-        self._on_order_cancelled = on_order_cancelled
-        self._on_trade = on_trade
-        self._on_position_update = on_position_update
+        super().set_event_handlers(
+            on_order_filled=on_order_filled,
+            on_order_cancelled=on_order_cancelled,
+            on_trade=on_trade,
+            on_position_update=on_position_update,
+        )
 
     async def start_ws_state(self) -> None:
         if self._ws_state_task and not self._ws_state_task.done():
@@ -433,6 +438,12 @@ class LighterConnector:
                     coi = int(od.get("client_order_index", 0) or 0)
                     if oi <= 0:
                         continue
+                    symbol = self._market_to_symbol.get(mid)
+                    is_ask = od.get("is_ask")
+                    if isinstance(is_ask, str):
+                        is_ask = is_ask.lower() in {"1", "true", "ask", "sell"}
+                    elif isinstance(is_ask, (int, float)):
+                        is_ask = bool(is_ask)
                     # terminal -> remove and fire event once
                     norm = status.strip().lower()
                     is_terminal = (
@@ -450,17 +461,23 @@ class LighterConnector:
                         if oi not in self._finalized_order_indices:
                             info = dict(od)
                             if norm.startswith("canceled") or norm.startswith("expired") or norm.startswith("rejected") or norm.startswith("failed"):
-                                if self._on_order_cancelled:
-                                    try:
-                                        self._on_order_cancelled(info)
-                                    except Exception:
-                                        pass
+                                self._update_order_state(
+                                    client_order_id=coi,
+                                    exchange_order_id=str(oi),
+                                    status=norm,
+                                    symbol=symbol,
+                                    is_ask=is_ask if isinstance(is_ask, bool) else None,
+                                    info=info,
+                                )
                             else:
-                                if self._on_order_filled:
-                                    try:
-                                        self._on_order_filled(info)
-                                    except Exception:
-                                        pass
+                                self._update_order_state(
+                                    client_order_id=coi,
+                                    exchange_order_id=str(oi),
+                                    status=norm,
+                                    symbol=symbol,
+                                    is_ask=is_ask if isinstance(is_ask, bool) else None,
+                                    info=info,
+                                )
                             self._finalized_order_indices.add(oi)
                         continue
                     # open/pending -> upsert
@@ -470,6 +487,14 @@ class LighterConnector:
                         info = self._inflight_by_coi.get(int(coi))
                         if info is not None:
                             self._inflight_by_idx[oi] = info
+                    self._update_order_state(
+                        client_order_id=coi if coi else None,
+                        exchange_order_id=str(oi),
+                        status=norm or "open",
+                        symbol=symbol,
+                        is_ask=is_ask if isinstance(is_ask, bool) else None,
+                        info=od,
+                    )
             # store back
             if curr_open:
                 self._active_orders_by_market[mid] = curr_open
@@ -494,11 +519,7 @@ class LighterConnector:
                     if not isinstance(t, dict):
                         continue
                     dq.append(t)
-                    if self._on_trade:
-                        try:
-                            self._on_trade(t)
-                        except Exception:
-                            pass
+                    self.emit_trade(t)
 
     def _apply_positions_update(self, positions_dict: Dict[str, Any]):
         for k, pos in positions_dict.items():
@@ -507,11 +528,7 @@ class LighterConnector:
             except Exception:
                 continue
             self._positions_by_market[mid] = pos
-            if self._on_position_update:
-                try:
-                    self._on_position_update(pos)
-                except Exception:
-                    pass
+            self.emit_position(pos)
 
     # account WS handler: cache positions and forward to user callback
     def _handle_account_update(self, account_id: str, payload: Dict[str, Any]):
@@ -529,11 +546,18 @@ class LighterConnector:
                 for coi, info in list(self._inflight_by_coi.items()):
                     if (txh and info.get("tx_hash") == txh) or (mid is not None and int(info.get("market_index")) == mid):
                         info["status"] = "filled"
-                        if self._on_order_filled:
-                            try:
-                                self._on_order_filled(info)
-                            except Exception:
-                                pass
+                        try:
+                            client_id = int(info.get("client_order_index")) if info.get("client_order_index") is not None else None
+                        except Exception:
+                            client_id = None
+                        exch_id = info.get("order_index")
+                        self._update_order_state(
+                            client_order_id=client_id,
+                            exchange_order_id=str(exch_id) if exch_id is not None else None,
+                            state=OrderState.FILLED,
+                            symbol=self._market_to_symbol.get(mid) if mid is not None else None,
+                            info=dict(info),
+                        )
                         oi = info.get("order_index")
                         if oi is not None:
                             self._inflight_by_idx.pop(int(oi), None)
@@ -559,11 +583,18 @@ class LighterConnector:
                     for coi, info in list(self._inflight_by_coi.items()):
                         if int(info.get("market_index")) == mid:
                             info["status"] = "filled"
-                            if self._on_order_filled:
-                                try:
-                                    self._on_order_filled(info)
-                                except Exception:
-                                    pass
+                            try:
+                                client_id = int(info.get("client_order_index")) if info.get("client_order_index") is not None else None
+                            except Exception:
+                                client_id = None
+                            exch_id = info.get("order_index")
+                            self._update_order_state(
+                                client_order_id=client_id,
+                                exchange_order_id=str(exch_id) if exch_id is not None else None,
+                                state=OrderState.FILLED,
+                                symbol=self._market_to_symbol.get(mid) if mid is not None else None,
+                                info=dict(info),
+                            )
                             oi = info.get("order_index")
                             if oi is not None:
                                 self._inflight_by_idx.pop(int(oi), None)
@@ -602,6 +633,20 @@ class LighterConnector:
             pass
         tif = lighter.SignerClient.ORDER_TIME_IN_FORCE_POST_ONLY if post_only else lighter.SignerClient.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME
         await self._throttler.acquire("/api/v1/sendTx")
+        self.create_tracking_limit_order(client_order_index, symbol=symbol, is_ask=is_ask, price_i=price, size_i=base_amount)
+        self._update_order_state(
+            client_order_id=client_order_index,
+            symbol=symbol,
+            is_ask=is_ask,
+            state=OrderState.SUBMITTING,
+            info={
+                "market_index": market_index,
+                "price": price,
+                "base_amount": base_amount,
+                "post_only": post_only,
+                "reduce_only": reduce_only,
+            },
+        )
         created_tx, ret, err = await self.signer.create_order(
             market_index=market_index,
             client_order_index=client_order_index,
@@ -642,7 +687,55 @@ class LighterConnector:
                 }
             except Exception:
                 pass
+            exch_id = None
+            if isinstance(ret, dict):
+                exch_id = ret.get("tx_hash") or ret.get("txHash")
+            self._update_order_state(
+                client_order_id=client_order_index,
+                exchange_order_id=str(exch_id) if exch_id else None,
+                symbol=symbol,
+                is_ask=is_ask,
+                state=OrderState.OPEN,
+                info=ret if isinstance(ret, dict) else {},
+            )
+        else:
+            self._update_order_state(
+                client_order_id=client_order_index,
+                symbol=symbol,
+                is_ask=is_ask,
+                state=OrderState.FAILED,
+                info={"error": err, "response": ret},
+            )
         return (created_tx, ret, err)
+
+    async def submit_limit_order(
+        self,
+        symbol: str,
+        client_order_index: int,
+        base_amount: int,
+        price: int,
+        is_ask: bool,
+        *,
+        post_only: bool = False,
+        reduce_only: int = 0,
+    ) -> TrackingLimitOrder:
+        tracker = self.create_tracking_limit_order(
+            client_order_index,
+            symbol=symbol,
+            is_ask=is_ask,
+            price_i=price,
+            size_i=base_amount,
+        )
+        await self.place_limit(
+            symbol=symbol,
+            client_order_index=client_order_index,
+            base_amount=base_amount,
+            price=price,
+            is_ask=is_ask,
+            post_only=post_only,
+            reduce_only=reduce_only,
+        )
+        return tracker
 
     async def is_coi_open(self, client_order_index: int, market_index: Optional[int] = None) -> Optional[bool]:
         """Best-effort REST check whether an order (by client_order_index) appears in account active orders.
@@ -705,6 +798,19 @@ class LighterConnector:
             return None, None, "invalid top-of-book price"
 
         await self._throttler.acquire("/api/v1/sendTx")
+        self.create_tracking_market_order(client_order_index, symbol=symbol, is_ask=is_ask)
+        self._update_order_state(
+            client_order_id=client_order_index,
+            symbol=symbol,
+            is_ask=is_ask,
+            state=OrderState.SUBMITTING,
+            info={
+                "market_index": market_index,
+                "base_amount": base_amount,
+                "avg_execution_price": avg_execution_price,
+                "reduce_only": reduce_only,
+            },
+        )
         created_tx, ret, err = await self.signer.create_market_order(
             market_index=market_index,
             client_order_index=client_order_index,
@@ -732,7 +838,46 @@ class LighterConnector:
                 }
             except Exception:
                 pass
+        if err:
+            self._update_order_state(
+                client_order_id=client_order_index,
+                symbol=symbol,
+                is_ask=is_ask,
+                state=OrderState.FAILED,
+                info={"error": err, "response": ret},
+            )
+        else:
+            exch_id = None
+            if isinstance(ret, dict):
+                exch_id = ret.get("tx_hash") or ret.get("txHash")
+            self._update_order_state(
+                client_order_id=client_order_index,
+                exchange_order_id=str(exch_id) if exch_id else None,
+                symbol=symbol,
+                is_ask=is_ask,
+                state=OrderState.FILLED,
+                info=ret if isinstance(ret, dict) else {},
+            )
         return (created_tx, ret, err)
+
+    async def submit_market_order(
+        self,
+        symbol: str,
+        client_order_index: int,
+        base_amount: int,
+        is_ask: bool,
+        *,
+        reduce_only: int = 0,
+    ) -> TrackingMarketOrder:
+        tracker = self.create_tracking_market_order(client_order_index, symbol=symbol, is_ask=is_ask)
+        await self.place_market(
+            symbol=symbol,
+            client_order_index=client_order_index,
+            base_amount=base_amount,
+            is_ask=is_ask,
+            reduce_only=reduce_only,
+        )
+        return tracker
 
     async def cancel_all(self) -> Tuple[Any, Any, Optional[str]]:
         await self._ensure_signer()
@@ -753,7 +898,70 @@ class LighterConnector:
         if market_index is None:
             raise ValueError("market_index required if order is not tracked")
         await self._throttler.acquire("/api/v1/sendTx")
-        return await self.signer.cancel_order(market_index=int(market_index), order_index=int(order_index))
+        result = await self.signer.cancel_order(market_index=int(market_index), order_index=int(order_index))
+        created_tx, ret, err = result
+        client_id = None
+        for coi, idx in self._order_index_by_coi.items():
+            if idx == int(order_index):
+                client_id = coi
+                break
+        state = OrderState.CANCELLED if err is None else OrderState.FAILED
+        self._update_order_state(
+            client_order_id=client_id,
+            exchange_order_id=str(order_index),
+            state=state,
+            symbol=self._market_to_symbol.get(int(market_index)) if market_index is not None else None,
+            info=ret if isinstance(ret, dict) else {"error": err},
+        )
+        return result
+
+    async def cancel_by_client_order_index(
+        self,
+        client_order_index: int,
+        symbol: Optional[str] = None,
+    ) -> Tuple[Any, Any, Optional[str]]:
+        await self._ensure_signer()
+        target_coi = int(client_order_index)
+        market_index: Optional[int] = None
+        info = self._inflight_by_coi.get(target_coi)
+        if info is not None:
+            try:
+                market_index = int(info.get("market_index"))
+            except Exception:
+                market_index = None
+        if market_index is None and symbol:
+            try:
+                market_index = await self.get_market_id(symbol)
+            except Exception:
+                market_index = None
+
+        order_index: Optional[int] = None
+        for _ in range(5):
+            order_index = self._order_index_by_coi.get(target_coi)
+            if order_index:
+                break
+            for mid, omap in self._active_orders_by_market.items():
+                for oi, od in omap.items():
+                    try:
+                        coi = int((od.get("client_order_index")) if isinstance(od, dict) else 0)
+                    except Exception:
+                        continue
+                    if coi == target_coi:
+                        order_index = int(oi)
+                        self._order_index_by_coi[target_coi] = order_index
+                        market_index = int(mid)
+                        break
+                if order_index:
+                    break
+            if order_index:
+                break
+            await asyncio.sleep(0.2)
+
+        if order_index is not None:
+            return await self.cancel_order(order_index=int(order_index), market_index=market_index)
+
+        # fallback: cancel all if unable to map specific order
+        return await self.cancel_all()
 
     async def is_order_open(self, order_index: int, market_index: Optional[int] = None) -> Optional[bool]:
         """Best-effort check via REST whether an order is still open.

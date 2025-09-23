@@ -165,8 +165,15 @@ class TradingCore:
                 self.logger.error("Error while stopping strategy")
                 self.dbg("strategy.stop exception", exc_info=True)
 
+        cancel_flag = bool(cancel_orders)
+        if cancel_flag and self.strategy is not None:
+            preserve = bool(getattr(self.strategy, "preserve_orders_on_stop", False))
+            if preserve:
+                self.logger.info("Strategy requested to keep open orders; skipping cancel_all on stop")
+                cancel_flag = False
+
         # Optionally cancel outstanding orders on connectors
-        if cancel_orders:
+        if cancel_flag:
             for name, conn in self.connectors.items():
                 try:
                     cancel_all = getattr(conn, "cancel_all", None)
@@ -201,8 +208,8 @@ class TradingCore:
         self.logger.info("TradingCore stopped")
         return True
 
-    async def shutdown(self) -> bool:
-        ok = await self.stop(cancel_orders=True)
+    async def shutdown(self, cancel_orders: bool = True) -> bool:
+        ok = await self.stop(cancel_orders=cancel_orders)
         # Clear references
         self.strategy = None
         self.connectors.clear()

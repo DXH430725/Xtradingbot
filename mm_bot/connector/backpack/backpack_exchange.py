@@ -12,6 +12,8 @@ from nacl.signing import SigningKey
 from nacl.encoding import RawEncoder
 
 from mm_bot.utils.throttler import RateLimiter, lighter_default_weights
+from mm_bot.connector.base import BaseConnector
+from mm_bot.execution.orders import OrderState, TrackingLimitOrder, TrackingMarketOrder
 
 
 @dataclass
@@ -21,6 +23,7 @@ class BackpackConfig:
     keys_file: str = "Backpack_key.txt"
     window_ms: int = 5000
     rpm: int = 300  # conservative default
+    broker_id: str = "1500"
 
 
 def load_backpack_keys(path: str) -> Tuple[Optional[str], Optional[str]]:
@@ -40,8 +43,9 @@ def load_backpack_keys(path: str) -> Tuple[Optional[str], Optional[str]]:
     return pub, priv
 
 
-class BackpackConnector:
-    def __init__(self, config: Optional[BackpackConfig] = None):
+class BackpackConnector(BaseConnector):
+    def __init__(self, config: Optional[BackpackConfig] = None, debug: bool = False):
+        super().__init__("backpack", debug=debug)
         self.config = config or BackpackConfig()
         self.log = logging.getLogger("mm_bot.connector.backpack")
 
@@ -53,6 +57,8 @@ class BackpackConnector:
         self._api_pub: Optional[str] = None
         self._api_priv: Optional[str] = None
         self._signing_key: Optional[SigningKey] = None
+        self._verifying_key_b64: Optional[str] = None
+        self._broker_id: str = self.config.broker_id
 
         # symbol map and scales
         self._symbol_to_market: Dict[str, str] = {}  # symbol string passthrough
@@ -64,11 +70,8 @@ class BackpackConnector:
         self._ws_task: Optional[asyncio.Task] = None
         self._ws_stop: bool = False
 
-        # event hooks
-        self._on_order_filled: Optional[Callable[[Dict[str, Any]], None]] = None
-        self._on_order_cancelled: Optional[Callable[[Dict[str, Any]], None]] = None
-        self._on_trade: Optional[Callable[[Dict[str, Any]], None]] = None
-        self._on_position_update: Optional[Callable[[Dict[str, Any]], None]] = None
+        # simple caches fed by private WS
+        self._positions_by_symbol: Dict[str, Dict[str, Any]] = {}
 
     # lifecycle ---------------------------------------------------------------
     def start(self, core=None):
@@ -82,6 +85,8 @@ class BackpackConnector:
         try:
             sk_bytes = base64.b64decode(priv)
             self._signing_key = SigningKey(sk_bytes)
+            vk = self._signing_key.verify_key.encode(RawEncoder)
+            self._verifying_key_b64 = base64.b64encode(vk).decode("utf-8")
         except Exception as e:
             raise RuntimeError(f"Invalid backpack private key: {e}")
         self._session = aiohttp.ClientSession()
@@ -101,17 +106,23 @@ class BackpackConnector:
         on_trade: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_position_update: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> None:
-        self._on_order_filled = on_order_filled
-        self._on_order_cancelled = on_order_cancelled
-        self._on_trade = on_trade
-        self._on_position_update = on_position_update
+        super().set_event_handlers(
+            on_order_filled=on_order_filled,
+            on_order_cancelled=on_order_cancelled,
+            on_trade=on_trade,
+            on_position_update=on_position_update,
+        )
 
     # helpers -----------------------------------------------------------------
     async def _ensure_markets(self):
         if self._market_info:
             return
         await self._throttler.acquire("/api/v1/markets")
-        async with self._session.get(self.config.base_url + "/api/v1/markets", timeout=15) as resp:
+        async with self._session.get(
+            self.config.base_url + "/api/v1/markets",
+            headers={"X-BROKER-ID": self._broker_id},
+            timeout=15,
+        ) as resp:
             data = await resp.json()
         # expect array of market dicts
         symbols = data if isinstance(data, list) else data.get("symbols")
@@ -154,7 +165,13 @@ class BackpackConnector:
     def _auth_headers(self, instruction: str, params: Dict[str, Any]) -> Dict[str, str]:
         ts = int(time.time() * 1000)
         window = int(self.config.window_ms)
-        items = sorted((k, v) for k, v in (params or {}).items())
+        encoded: List[Tuple[str, Any]] = []
+        for k, v in (params or {}).items():
+            if isinstance(v, bool):
+                encoded.append((k, str(v).lower()))
+            else:
+                encoded.append((k, v))
+        items = sorted(encoded)
         if items:
             kv = "&".join([f"{k}={v}" for k, v in items])
             msg = f"instruction={instruction}&{kv}&timestamp={ts}&window={window}"
@@ -162,10 +179,11 @@ class BackpackConnector:
             msg = f"instruction={instruction}&timestamp={ts}&window={window}"
         sig = self._signing_key.sign(msg.encode("utf-8"), encoder=RawEncoder).signature
         return {
-            "X-API-Key": str(self._api_pub or ""),
-            "X-Timestamp": str(ts),
-            "X-Window": str(window),
-            "X-Signature": base64.b64encode(sig).decode("utf-8"),
+            "X-API-KEY": str(self._api_pub or ""),
+            "X-TIMESTAMP": str(ts),
+            "X-WINDOW": str(window),
+            "X-SIGNATURE": base64.b64encode(sig).decode("utf-8"),
+            "X-BROKER-ID": self._broker_id,
             "Content-Type": "application/json",
         }
 
@@ -173,7 +191,11 @@ class BackpackConnector:
     async def best_effort_latency_ms(self) -> float:
         t0 = time.perf_counter()
         await self._throttler.acquire("/api/v1/status")
-        async with self._session.get(self.config.base_url + "/api/v1/status", timeout=10) as resp:
+        async with self._session.get(
+            self.config.base_url + "/api/v1/status",
+            headers={"X-BROKER-ID": self._broker_id},
+            timeout=10,
+        ) as resp:
             _ = await resp.text()
         return (time.perf_counter() - t0) * 1000.0
 
@@ -184,8 +206,39 @@ class BackpackConnector:
         async with self._session.get(self.config.base_url + "/api/v1/account", headers=headers, timeout=15) as resp:
             return await resp.json()
 
+    async def get_balances(self) -> Dict[str, Any]:
+        await self._throttler.acquire("/api/v1/capital")
+        headers = self._auth_headers("balanceQuery", {})
+        async with self._session.get(
+            self.config.base_url + "/api/v1/capital",
+            headers=headers,
+            timeout=15,
+        ) as resp:
+            if resp.status != 200:
+                return {}
+            return await resp.json()
+
+    async def get_collateral(self) -> Dict[str, Any]:
+        await self._throttler.acquire("/api/v1/capital/collateral")
+        headers = self._auth_headers("collateralQuery", {})
+        async with self._session.get(
+            self.config.base_url + "/api/v1/capital/collateral",
+            headers=headers,
+            timeout=15,
+        ) as resp:
+            if resp.status != 200:
+                return {}
+            return await resp.json()
+
     async def get_positions(self) -> List[Dict[str, Any]]:
-        # positions endpoint may vary; best-effort return empty list if unsupported
+        if self._positions_by_symbol:
+            out: List[Dict[str, Any]] = []
+            for sym, pos in self._positions_by_symbol.items():
+                item = dict(pos)
+                item.setdefault("symbol", sym)
+                out.append(item)
+            return out
+        # fallback to REST endpoint if WS data unavailable
         try:
             await self._throttler.acquire("/api/v1/positions")
             headers = self._auth_headers("positionQuery", {})
@@ -213,12 +266,53 @@ class BackpackConnector:
             return data
         return []
 
+    async def get_market_info(self, symbol: str) -> Dict[str, Any]:
+        await self._ensure_markets()
+        info = self._market_info.get(symbol)
+        if not info:
+            raise ValueError(f"Unknown symbol {symbol}")
+        filters = info.get("filters") or {}
+        price_filter = filters.get("price") or {}
+        qty_filter = filters.get("quantity") or {}
+        min_qty = float(qty_filter.get("min", qty_filter.get("minQty", qty_filter.get("minQuantity", 0.0))))
+        min_step = float(qty_filter.get("stepSize", qty_filter.get("step", 0.0)) or 0.0)
+        tick_size = float(price_filter.get("tickSize", price_filter.get("tick", 0.0)) or 0.0)
+        return {
+            "symbol": symbol,
+            "base_asset": info.get("baseAsset") or info.get("baseAssetSymbol") or info.get("baseAssetName"),
+            "quote_asset": info.get("quoteAsset") or info.get("quoteAssetSymbol") or info.get("quoteAssetName"),
+            "tick_size": tick_size,
+            "step_size": min_step,
+            "min_qty": min_qty,
+            "price_precision": self._price_decimals.get(symbol, 2),
+            "quantity_precision": self._size_decimals.get(symbol, 6),
+        }
+
+    async def get_order_book(self, symbol: str, depth: int = 50) -> Dict[str, Any]:
+        await self._ensure_markets()
+        params = {"symbol": symbol, "limit": max(1, min(depth, 200))}
+        await self._throttler.acquire("/api/v1/depth")
+        async with self._session.get(
+            self.config.base_url + "/api/v1/depth",
+            params=params,
+            headers={"X-BROKER-ID": self._broker_id},
+            timeout=10,
+        ) as resp:
+            if resp.status != 200:
+                return {}
+            return await resp.json()
+
     async def get_top_of_book(self, symbol: str) -> Tuple[Optional[int], Optional[int], int]:
         await self._ensure_markets()
         p_dec, _s_dec = await self.get_price_size_decimals(symbol)
         params = {"symbol": symbol, "limit": 1}
         await self._throttler.acquire("/api/v1/depth")
-        async with self._session.get(self.config.base_url + "/api/v1/depth", params=params, timeout=10) as resp:
+        async with self._session.get(
+            self.config.base_url + "/api/v1/depth",
+            params=params,
+            headers={"X-BROKER-ID": self._broker_id},
+            timeout=10,
+        ) as resp:
             data = await resp.json()
         bids = data.get("bids") or []
         asks = data.get("asks") or []
@@ -265,15 +359,83 @@ class BackpackConnector:
         # clientId must be integer
         body["clientId"] = int(body.get("clientId"))
         headers = self._auth_headers("orderExecute", body)
+        self.create_tracking_limit_order(client_order_index, symbol=symbol, is_ask=is_ask, price_i=price, size_i=base_amount)
+        self._update_order_state(
+            client_order_id=client_order_index,
+            symbol=symbol,
+            is_ask=is_ask,
+            state=OrderState.SUBMITTING,
+            info={"request": body},
+        )
         await self._throttler.acquire("/api/v1/order")
-        async with self._session.post(self.config.base_url + "/api/v1/order", headers=headers, json=body, timeout=20) as resp:
+        async with self._session.post(
+            self.config.base_url + "/api/v1/order",
+            headers=headers,
+            json=body,
+            timeout=20,
+        ) as resp:
             try:
                 ret = await resp.json()
             except Exception:
                 txt = await resp.text()
-                return None, None, f"http_{resp.status}:{txt[:120]}"
+                err_msg = f"http_{resp.status}:{txt[:120]}"
+                self._update_order_state(
+                    client_order_id=client_order_index,
+                    symbol=symbol,
+                    is_ask=is_ask,
+                    state=OrderState.FAILED,
+                    info={"error": err_msg},
+                )
+                return None, None, err_msg
         err = None if (isinstance(ret, dict) and ret.get("id")) else (ret.get("message") if isinstance(ret, dict) else "unknown")
+        if err:
+            self._update_order_state(
+                client_order_id=client_order_index,
+                symbol=symbol,
+                is_ask=is_ask,
+                state=OrderState.FAILED,
+                info=ret if isinstance(ret, dict) else {"error": err},
+            )
+            return ret, ret, err
+        order_id = ret.get("id") if isinstance(ret, dict) else None
+        self._update_order_state(
+            client_order_id=client_order_index,
+            exchange_order_id=str(order_id) if order_id is not None else None,
+            symbol=symbol,
+            is_ask=is_ask,
+            state=OrderState.OPEN,
+            info=ret if isinstance(ret, dict) else {},
+        )
         return ret, ret, err
+
+    async def submit_limit_order(
+        self,
+        symbol: str,
+        client_order_index: int,
+        base_amount: int,
+        price: int,
+        is_ask: bool,
+        *,
+        post_only: bool = False,
+        reduce_only: int = 0,
+    ) -> TrackingLimitOrder:
+        tracker = self.create_tracking_limit_order(
+            client_order_index,
+            symbol=symbol,
+            is_ask=is_ask,
+            price_i=price,
+            size_i=base_amount,
+        )
+        await self.place_limit(
+            symbol=symbol,
+            client_order_index=client_order_index,
+            base_amount=base_amount,
+            price=price,
+            is_ask=is_ask,
+            post_only=post_only,
+            reduce_only=reduce_only,
+        )
+        return tracker
 
     async def place_market(
         self,
@@ -299,35 +461,175 @@ class BackpackConnector:
         # clientId must be integer
         body["clientId"] = int(body.get("clientId"))
         headers = self._auth_headers("orderExecute", body)
+        self.create_tracking_market_order(client_order_index, symbol=symbol, is_ask=is_ask)
+        self._update_order_state(
+            client_order_id=client_order_index,
+            symbol=symbol,
+            is_ask=is_ask,
+            state=OrderState.SUBMITTING,
+            info={"request": body},
+        )
         await self._throttler.acquire("/api/v1/order")
-        async with self._session.post(self.config.base_url + "/api/v1/order", headers=headers, json=body, timeout=20) as resp:
+        async with self._session.post(
+            self.config.base_url + "/api/v1/order",
+            headers=headers,
+            json=body,
+            timeout=20,
+        ) as resp:
             try:
                 ret = await resp.json()
             except Exception:
                 txt = await resp.text()
-                return None, None, f"http_{resp.status}:{txt[:120]}"
+                err_msg = f"http_{resp.status}:{txt[:120]}"
+                self._update_order_state(
+                    client_order_id=client_order_index,
+                    symbol=symbol,
+                    is_ask=is_ask,
+                    state=OrderState.FAILED,
+                    info={"error": err_msg},
+                )
+                return None, None, err_msg
         err = None if (isinstance(ret, dict) and ret.get("id")) else (ret.get("message") if isinstance(ret, dict) else "unknown")
+        if err:
+            self._update_order_state(
+                client_order_id=client_order_index,
+                symbol=symbol,
+                is_ask=is_ask,
+                state=OrderState.FAILED,
+                info=ret if isinstance(ret, dict) else {"error": err},
+            )
+            return ret, ret, err
+        order_id = ret.get("id") if isinstance(ret, dict) else None
+        self._update_order_state(
+            client_order_id=client_order_index,
+            exchange_order_id=str(order_id) if order_id is not None else None,
+            symbol=symbol,
+            is_ask=is_ask,
+            state=OrderState.FILLED,  # market assumed immediate
+            info=ret if isinstance(ret, dict) else {},
+        )
         return ret, ret, err
 
+    async def submit_market_order(
+        self,
+        symbol: str,
+        client_order_index: int,
+        base_amount: int,
+        is_ask: bool,
+        *,
+        reduce_only: int = 0,
+    ) -> TrackingMarketOrder:
+        tracker = self.create_tracking_market_order(client_order_index, symbol=symbol, is_ask=is_ask)
+        await self.place_market(
+            symbol=symbol,
+            client_order_index=client_order_index,
+            base_amount=base_amount,
+            is_ask=is_ask,
+            reduce_only=reduce_only,
+        )
+        return tracker
+
     async def cancel_order(self, order_index: str, symbol: Optional[str] = None) -> Tuple[Any, Any, Optional[str]]:
-        params: Dict[str, Any] = {}
+        payload: Dict[str, Any] = {}
         if symbol:
-            params["symbol"] = symbol
-        params["orderId"] = order_index
-        headers = self._auth_headers("orderCancel", params)
+            payload["symbol"] = symbol
+        try:
+            payload["orderId"] = int(str(order_index))
+        except Exception:
+            payload["orderId"] = str(order_index)
+        headers = self._auth_headers("orderCancel", payload)
         await self._throttler.acquire("/api/v1/order")
-        async with self._session.delete(self.config.base_url + "/api/v1/order", params=params, headers=headers, timeout=15) as resp:
+        async with self._session.request(
+            "DELETE",
+            self.config.base_url + "/api/v1/order",
+            headers=headers,
+            json=payload,
+            timeout=15,
+        ) as resp:
             try:
                 ret = await resp.json()
             except Exception:
                 txt = await resp.text()
-                return None, None, f"http_{resp.status}:{txt[:120]}"
-        # success if echo back orderId or status
-        ok = isinstance(ret, dict) and (ret.get("orderId") or ret.get("status") == "Cancelled")
-        return ret, ret, None if ok else "cancel_failed"
+                err_msg = f"http_{resp.status}:{txt[:120]}"
+                self._update_order_state(
+                    exchange_order_id=str(order_index),
+                    symbol=symbol,
+                    state=OrderState.FAILED,
+                    info={"error": err_msg},
+                )
+                return None, None, err_msg
+        if isinstance(ret, dict):
+            status = str(ret.get("status", "")).lower()
+            if status in {"filled", "cancelled", "canceled", "partiallyfilled", "expired"}:
+                self._update_order_state(
+                    exchange_order_id=str(order_index),
+                    symbol=symbol,
+                    status=status,
+                    info=ret,
+                )
+                return ret, ret, None
+        self._update_order_state(
+            exchange_order_id=str(order_index),
+            symbol=symbol,
+            state=OrderState.FAILED,
+            info=ret if isinstance(ret, dict) else {},
+        )
+        return ret, ret, "cancel_failed"
+
+    async def get_order(
+        self,
+        symbol: str,
+        order_id: Optional[str] = None,
+        client_id: Optional[int] = None,
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        params: Dict[str, Any] = {"symbol": symbol}
+        if order_id:
+            params["orderId"] = order_id
+        if client_id is not None:
+            params["clientId"] = int(client_id)
+        headers = self._auth_headers("orderQuery", params)
+        await self._throttler.acquire("/api/v1/order")
+        async with self._session.get(
+            self.config.base_url + "/api/v1/order",
+            params=params,
+            headers=headers,
+            timeout=15,
+        ) as resp:
+            if resp.status == 404:
+                return None, "not_found"
+            if resp.status == 410:
+                return None, "gone"
+            try:
+                data = await resp.json()
+            except Exception:
+                txt = await resp.text()
+                return None, f"http_{resp.status}:{txt[:120]}"
+        if isinstance(data, dict) and data.get("id"):
+            return data, None
+        return data if isinstance(data, dict) else None, None
 
     async def cancel_all(self, symbol: Optional[str] = None) -> Tuple[Any, Any, Optional[str]]:
-        # Backpack may support bulk cancel via /wapi/v1/order with action, otherwise loop existing
+        payload: Dict[str, Any] = {}
+        if symbol:
+            payload["symbol"] = symbol
+        headers = self._auth_headers("orderCancelAll", payload)
+        await self._throttler.acquire("/api/v1/orders")
+        async with self._session.request(
+            "DELETE",
+            self.config.base_url + "/api/v1/orders",
+            headers=headers,
+            json=payload,
+            timeout=20,
+        ) as resp:
+            try:
+                data = await resp.json()
+            except Exception:
+                txt = await resp.text()
+                data = {"status": resp.status, "message": txt[:120]}
+        status = str(data.get("status", "")).lower() if isinstance(data, dict) else ""
+        if resp.status == 200 and status in {"success", "ok", "cancelled", "canceled"}:
+            return data, data, None
+        # fallback
         orders = await self.get_open_orders(symbol)
         last_err = None
         for od in orders:
@@ -337,9 +639,21 @@ class BackpackConnector:
                 _, _, err = await self.cancel_order(oid, sym)
                 if err:
                     last_err = err
-            except Exception as e:
-                last_err = str(e)
-        return None, None, last_err
+            except Exception as exc:
+                last_err = str(exc)
+        return data, data, last_err
+
+    async def cancel_by_client_id(self, symbol: str, client_id: int) -> Tuple[Any, Any, Optional[str]]:
+        try:
+            order, err = await self.get_order(symbol, client_id=int(client_id))
+        except Exception as exc:
+            return None, None, str(exc)
+        if err:
+            return None, None, err
+        if not order or order.get("id") is None:
+            return None, None, "order_not_found"
+        order_id = order.get("id") or order.get("orderId")
+        return await self.cancel_order(order_id, symbol)
 
     # ws state ---------------------------------------------------------------
     async def start_ws_state(self, symbols: Optional[List[str]] = None):
@@ -367,9 +681,8 @@ class BackpackConnector:
                     subs = []
                     for s in symbols:
                         subs.append({"method": "SUBSCRIBE", "params": [f"depth.1000ms.{s}"], "id": int(time.time()) % 1_000_000})
-                    # private topics (if available without extra auth)
-                    subs.append({"method": "SUBSCRIBE", "params": ["orderUpdate"], "id": 1})
-                    subs.append({"method": "SUBSCRIBE", "params": ["positionUpdate"], "id": 2})
+                    # private topics with ED25519 signature
+                    subs.extend(self._private_ws_subscriptions(symbols))
                     for p in subs:
                         await ws.send(json.dumps(p))
                     # consume
@@ -386,23 +699,126 @@ class BackpackConnector:
                         payload = data.get("data") if isinstance(data, dict) else None
                         if not isinstance(payload, dict):
                             payload = data if isinstance(data, dict) else None
+                        handled = False
+                        if stream.startswith("account.orderupdate") or (isinstance(payload, dict) and payload.get("e", "").lower().startswith("order")):
+                            handled = True
+                            if isinstance(payload, dict):
+                                self._handle_private_order_event(payload)
+                        if stream.startswith("account.positionupdate") or (isinstance(payload, dict) and payload.get("e", "").lower().startswith("position")):
+                            handled = True
+                            if isinstance(payload, dict):
+                                self._handle_private_position_event(payload)
+                        if handled:
+                            continue
                         if stream.endswith("orderupdate") or (isinstance(payload, dict) and (payload.get("id") or payload.get("clientId"))):
-                            if self._on_order_filled and isinstance(payload, dict) and str(payload.get("status")).lower() in ("filled", "partiallyfilled"):
-                                try:
-                                    self._on_order_filled(payload)
-                                except Exception:
-                                    pass
-                            if self._on_order_cancelled and isinstance(payload, dict) and str(payload.get("status")).lower() in ("cancelled", "canceled"):
-                                try:
-                                    self._on_order_cancelled(payload)
-                                except Exception:
-                                    pass
-                        if stream.endswith("positionupdate") and self._on_position_update and isinstance(payload, dict):
-                            try:
-                                self._on_position_update(payload)
-                            except Exception:
-                                pass
+                            if isinstance(payload, dict):
+                                self._handle_private_order_event(payload)
+                        if stream.endswith("positionupdate") and isinstance(payload, dict):
+                            self._handle_private_position_event(payload)
             except asyncio.CancelledError:
                 break
             except Exception:
                 await asyncio.sleep(1.0)
+
+    def _private_ws_subscriptions(self, symbols: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        if not self._signing_key:
+            return []
+        streams = {"account.positionUpdate"}
+        if symbols:
+            for sym in symbols:
+                if not sym:
+                    continue
+                sym_u = str(sym).upper()
+                streams.add(f"account.orderUpdate.{sym_u}")
+                streams.add(f"account.positionUpdate.{sym_u}")
+        else:
+            streams.add("account.orderUpdate")
+        payloads: List[Dict[str, Any]] = []
+        window = int(self.config.window_ms)
+        verifying = self._api_pub or self._verifying_key_b64 or ""
+        for stream in streams:
+            ts = int(time.time() * 1000)
+            msg = f"instruction=subscribe&timestamp={ts}&window={window}"
+            try:
+                sig = self._signing_key.sign(msg.encode("utf-8"), encoder=RawEncoder).signature
+            except Exception:
+                continue
+            sig_b64 = base64.b64encode(sig).decode("utf-8")
+            payloads.append(
+                {
+                    "method": "SUBSCRIBE",
+                    "params": [stream],
+                    "signature": [verifying, sig_b64, str(ts), str(window)],
+                }
+            )
+        return payloads
+
+    def _handle_private_order_event(self, payload: Dict[str, Any]) -> None:
+        normalized = dict(payload)
+        if "X" in payload and "status" not in normalized:
+            normalized["status"] = payload.get("X")
+        if "c" in payload and "clientId" not in normalized:
+            normalized["clientId"] = payload.get("c")
+        if "i" in payload:
+            normalized.setdefault("id", payload.get("i"))
+        if "s" in payload:
+            normalized.setdefault("symbol", payload.get("s"))
+
+        status = str(normalized.get("status", "") or "").lower()
+        event = str(payload.get("e", "") or "").lower()
+
+        if status:
+            normalized["status"] = status
+        if event:
+            normalized["event"] = event
+
+        client_raw = normalized.get("clientId") or normalized.get("clientID") or normalized.get("c")
+        try:
+            client_id = int(client_raw) if client_raw is not None else None
+        except (TypeError, ValueError):
+            client_id = None
+        exch_id = normalized.get("id") or normalized.get("orderId") or normalized.get("i")
+        symbol = normalized.get("symbol") or normalized.get("s")
+        side = normalized.get("side") or normalized.get("S")
+        is_ask = None
+        if isinstance(side, str):
+            side_lower = side.lower()
+            if side_lower in {"ask", "sell", "s"}:
+                is_ask = True
+            elif side_lower in {"bid", "buy", "b"}:
+                is_ask = False
+
+        filled_qty = normalized.get("filledQuantity") or normalized.get("z")
+        remaining_qty = normalized.get("remainingQuantity") or normalized.get("l")
+        try:
+            filled = float(filled_qty) if filled_qty is not None else None
+        except (TypeError, ValueError):
+            filled = None
+        try:
+            remaining = float(remaining_qty) if remaining_qty is not None else None
+        except (TypeError, ValueError):
+            remaining = None
+
+        self._update_order_state(
+            client_order_id=client_id,
+            exchange_order_id=str(exch_id) if exch_id is not None else None,
+            status=status,
+            symbol=symbol,
+            is_ask=is_ask,
+            filled_base=filled,
+            remaining_base=remaining,
+            info=normalized,
+        )
+
+    def _handle_private_position_event(self, payload: Dict[str, Any]) -> None:
+        normalized = dict(payload)
+        symbol = payload.get("symbol") or payload.get("s")
+        qty_val = payload.get("q") or payload.get("netQuantity")
+        try:
+            normalized["position"] = float(qty_val)
+        except Exception:
+            pass
+        if symbol:
+            normalized["symbol"] = symbol
+            self._positions_by_symbol[str(symbol).upper()] = normalized
+        self.emit_position(normalized)

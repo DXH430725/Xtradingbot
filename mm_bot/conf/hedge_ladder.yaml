@@ -1,0 +1,30 @@
+general:
+  log_config: mm_bot/conf/logging.yaml
+  tick_size: 0.5
+
+connector:
+  backpack_base_url: https://api.backpack.exchange
+  backpack_ws_url: wss://ws.backpack.exchange
+  backpack_keys_file: Backpack_key.txt
+  backpack_rpm: 300
+  backpack_window_ms: 5000
+  lighter_base_url: https://mainnet.zklighter.elliot.ai
+  lighter_keys_file: Lighter_key2.txt
+  lighter_account_index: null
+  lighter_rpm: 4000
+
+strategy:
+  hedge_ladder:
+    backpack_symbol: BTC_USDC_PERP
+    lighter_symbol: BTC
+    quantity_base: 0.0002
+    take_profit_abs: 5.0
+    max_concurrent_positions: 10
+    entry_interval_secs: 60.0
+    poll_interval_ms: 500
+    hedge_trigger_ratio: 0.99
+    hedge_rate_limit_per_sec: 10
+    hedge_retry: 3
+    hedge_retry_delay: 0.2
+    lighter_reduce_only_close: true
+    debug: false

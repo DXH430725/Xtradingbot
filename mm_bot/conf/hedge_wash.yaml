@@ -1,0 +1,22 @@
+lighter:
+  base_url: https://mainnet.zklighter.elliot.ai
+  keys_file: Lighter_key2.txt
+  account_index: null
+  rpm: 600
+
+backpack:
+  base_url: https://api.backpack.exchange
+  ws_url: wss://ws.backpack.exchange
+  keys_file: Backpack_key.txt
+  window_ms: 5000
+  rpm: 300
+
+strategy:
+  hold_seconds_min: 600
+  hold_seconds_max: 900
+  cooldown_seconds_min: 0
+  cooldown_seconds_max: 300
+  backpack_fill_timeout: 180.0
+  lighter_fill_timeout: 90.0
+  reprice_after_seconds: 5.0
+  max_reprice_attempts: 100

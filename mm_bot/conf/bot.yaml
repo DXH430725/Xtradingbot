@@ -1,29 +1,31 @@
 general:
   log_config: mm_bot/conf/logging.yaml
   log_dir: logs
-  tick_size: 5.0
-  # Trading pair symbol (global default). For Lighter use full symbol like BTC_USDT_Perp; for GRVT use exchange-native.
+  tick_size: 10.0
+  # Trading pair symbol (global default). For Backpack use the API symbol like BTC_USDC_PERP.
   # You can also set per-strategy under strategy.trend_ladder.symbol (takes precedence), or via env XTB_SYMBOL.
   symbol: BTC
 
 connector:
-  base_url: https://mainnet.zklighter.elliot.ai
-  keys_file: Lighter_key.txt
-  account_index: null
-  rpm: 4000
+  base_url: https://api.backpack.exchange
+  ws_url: wss://ws.backpack.exchange
+  keys_file: Backpack_key.txt
+  broker_id: "1500"
+  window_ms: 5000
+  rpm: 300
 
 strategy:
   name: trend_ladder
   trend_ladder:
     # Optional per-strategy override of trading pair (takes precedence over general.symbol and env)
-    symbol: BTC
+    symbol: BTC_USDC_PERP
     fixed_direction: long  # long | short
     quantity_base: 0.0006
-    take_profit_abs: 10
+    take_profit_abs: 60.0
     max_orders: 50
-    base_wait: 450.0
-    min_wait: 60.0
-    max_wait: 900.0
+    base_wait: 900.0
+    min_wait: 120.0
+    max_wait: 1800.0
     ema_len: 50
     atr_len: 14
     slope_up: 0.2
@@ -43,7 +45,7 @@ strategy:
     requote_skip_backoff_secs: 15.0
     requote_skip_backoff_max_secs: 120.0
     telemetry_enabled: 1
-    telemetry_url: "http://185.184.69.81:10123/ingest/Lighter01"
+    telemetry_url: "http://185.184.69.81:10123/ingest/Backpack01"
     telemetry_interval_secs: 10
 
   as_model:

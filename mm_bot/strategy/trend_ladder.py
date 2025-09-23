@@ -7,7 +7,7 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 from collections import deque
 
 from mm_bot.strategy.strategy_base import StrategyBase
-from mm_bot.connector.lighter.lighter_exchange import LighterConnector
+from mm_bot.connector.backpack.backpack_exchange import BackpackConnector
 
 
 @dataclass
@@ -53,7 +53,7 @@ class TrendLadderParams:
 class TrendAdaptiveLadderStrategy(StrategyBase):
     def __init__(
         self,
-        connector: LighterConnector,
+        connector: BackpackConnector,
         symbol: Optional[str] = None,
         params: Optional[TrendLadderParams] = None,
     ):
@@ -61,6 +61,7 @@ class TrendAdaptiveLadderStrategy(StrategyBase):
         self.connector = connector
         self.symbol = symbol
         self.params = params or TrendLadderParams()
+        self.preserve_orders_on_stop: bool = True
 
         self._core: Any = None
         self._started = False
@@ -71,6 +72,8 @@ class TrendAdaptiveLadderStrategy(StrategyBase):
         self._price_scale: int = 1
         self._size_scale: int = 1
         self._min_size_i: int = 1
+        self._price_tick_i: int = 1
+        self._size_step_i: int = 1
 
         # bar aggregator (1m)
         self._cur_minute: Optional[int] = None
@@ -97,7 +100,7 @@ class TrendAdaptiveLadderStrategy(StrategyBase):
         # timing
         self._last_entry_time: float = 0.0
         self._immediate_entry: bool = False
-        self._did_initial_cleanup: bool = False
+        self._hydrated_open_orders: bool = False
         self._last_close_orders: int = 0
         self._entry_filled_i_long: int = 0
         self._entry_filled_i_short: int = 0
@@ -107,10 +110,10 @@ class TrendAdaptiveLadderStrategy(StrategyBase):
         # telemetry task
         self._telemetry_task: Optional[asyncio.Task] = None
         # requote backoff for stubborn orders (by order_index)
-        self._requote_skip_until: Dict[int, float] = {}
-        self._requote_skip_count: Dict[int, int] = {}
+        self._requote_skip_until: Dict[str, float] = {}
+        self._requote_skip_count: Dict[str, int] = {}
         # first-seen timestamp for stuck oi during requote
-        self._requote_first_seen_ts: Dict[int, float] = {}
+        self._requote_first_seen_ts: Dict[str, float] = {}
 
     async def _place_limit_with_retry(
         self,
@@ -122,10 +125,27 @@ class TrendAdaptiveLadderStrategy(StrategyBase):
         retries: int = 3,
         retry_delay: float = 0.2,
     ) -> Tuple[Optional[int], Optional[Any], Optional[str]]:
+        base_amount_i = int(base_amount_i)
+        if base_amount_i <= 0:
+            return None, None, "size_below_min"
         cio = int(time.time() * 1000) % 1_000_000
         last_err = None
         for attempt in range(max(1, retries)):
             try:
+                self.log.debug(
+                    "place_limit attempt=%s/%s symbol=%s price_i=%s price=%.8f size_i=%s size=%.8f is_ask=%s post_only=%s reduce_only=%s coi=%s",
+                    attempt + 1,
+                    retries,
+                    self.symbol,
+                    price_i,
+                    price_i / float(self._price_scale or 1),
+                    base_amount_i,
+                    base_amount_i / float(self._size_scale or 1),
+                    is_ask,
+                    post_only,
+                    reduce_only,
+                    cio,
+                )
                 _tx, ret, err = await self.connector.place_limit(self.symbol, cio, base_amount_i, price=price_i, is_ask=is_ask, post_only=post_only, reduce_only=reduce_only)
                 if err and ("invalid nonce" in str(err).lower() or "nonce" in str(err).lower()):
                     last_err = err
@@ -165,8 +185,10 @@ class TrendAdaptiveLadderStrategy(StrategyBase):
     # --------------- events ---------------
     def _on_filled(self, info: Dict[str, Any]) -> None:
         try:
-            coi = int(info.get("client_order_index", -1))
+            coi = self._client_order_index_of(info)
         except Exception:
+            return
+        if coi is None:
             return
         meta = self._orders.get(coi)
         if not meta:
@@ -178,6 +200,8 @@ class TrendAdaptiveLadderStrategy(StrategyBase):
             # remove from entry tracking
             (self._entry_cois_long if side == "long" else self._entry_cois_short).discard(coi)
             # place TP immediately
+            now = time.time()
+            self._last_entry_time = now
             asyncio.create_task(self._place_tp_for_entry(entry_i, side))
         elif typ == "tp":
             # TP done -> schedule an immediate new entry if direction matches
@@ -186,14 +210,17 @@ class TrendAdaptiveLadderStrategy(StrategyBase):
 
     def _on_cancelled(self, info: Dict[str, Any]) -> None:
         try:
-            coi = int(info.get("client_order_index", -1))
+            coi = self._client_order_index_of(info)
         except Exception:
+            return
+        if coi is None:
             return
         meta = self._orders.pop(coi, None)
         if not meta:
             return
         if meta.get("type") == "entry":
             (self._entry_cois_long if meta.get("side") == "long" else self._entry_cois_short).discard(coi)
+            self._immediate_entry = True
         elif meta.get("type") == "tp":
             self._tp_cois.discard(coi)
 
@@ -201,7 +228,14 @@ class TrendAdaptiveLadderStrategy(StrategyBase):
     async def _ensure_ready(self) -> None:
         if self._market_id is not None and self.symbol is not None and self._size_i is not None:
             return
-        await self.connector.start_ws_state()
+        # Backpack WS requires explicit symbols when available to reduce noise
+        try:
+            if self.symbol:
+                await self.connector.start_ws_state([self.symbol])
+            else:
+                await self.connector.start_ws_state()
+        except TypeError:
+            await self.connector.start_ws_state()
         await self.connector._ensure_markets()
         if self.symbol is None:
             sym = next((s for s in self.connector._symbol_to_market.keys() if s.upper().startswith("BTC")), None)
@@ -209,23 +243,260 @@ class TrendAdaptiveLadderStrategy(StrategyBase):
                 raise RuntimeError("No BTC symbol available")
             self.symbol = sym
         self._market_id = await self.connector.get_market_id(self.symbol)
-        # scales
-        _p_dec, s_dec = await self.connector.get_price_size_decimals(self.symbol)
-        self._price_scale = 10 ** _p_dec
+        # scales and min size from market info
+        p_dec, s_dec = await self.connector.get_price_size_decimals(self.symbol)
+        self._price_scale = 10 ** p_dec
         self._size_scale = 10 ** s_dec
-        # min size and desired per-order size
-        ob_list = await self.connector.order_api.order_books()
-        entry = next((e for e in ob_list.order_books if int(e.market_id) == self._market_id), None)
-        if entry is None:
-            raise RuntimeError("Market entry not found")
-        min_size_i = max(1, int(round(float(entry.min_base_amount) * (10 ** s_dec))))
+        info = await self.connector.get_market_info(self.symbol)
+        try:
+            min_size = float(
+                info.get("min_qty")
+                or info.get("minQuantity")
+                or info.get("minBase")
+                or info.get("minBaseAmount")
+                or 0.0
+            )
+        except Exception:
+            min_size = 0.0
+        try:
+            step_size = float(
+                info.get("step_size")
+                or info.get("quantity_step")
+                or info.get("stepSize")
+                or info.get("quantityStep")
+                or 0.0
+            )
+        except Exception:
+            step_size = 0.0
+        try:
+            tick_size = float(
+                info.get("tick_size")
+                or info.get("price_tick")
+                or info.get("tickSize")
+                or info.get("priceTick")
+                or 0.0
+            )
+        except Exception:
+            tick_size = 0.0
+        min_size_i = max(1, int(round(min_size * (10 ** s_dec))))
+        self._size_step_i = max(1, int(round(step_size * (10 ** s_dec)))) if step_size > 0 else 1
+        if self._size_step_i > 1:
+            min_size_i = ((min_size_i + self._size_step_i - 1) // self._size_step_i) * self._size_step_i
         self._min_size_i = min_size_i
+        self._price_tick_i = max(1, int(round(tick_size * (10 ** p_dec)))) if tick_size > 0 else 1
         want_size_i = int(round(float(self.params.quantity_base) * (10 ** s_dec)))
+        if self._size_step_i > 1:
+            want_size_i = ((want_size_i + self._size_step_i - 1) // self._size_step_i) * self._size_step_i
         self._size_i = max(min_size_i, want_size_i)
-        self.log.info(f"TrendLadder ready: symbol={self.symbol} market_id={self._market_id} size_i(min)={min_size_i} size_i(use)={self._size_i}")
+        if self._size_step_i > 1:
+            self._size_i = ((self._size_i + self._size_step_i - 1) // self._size_step_i) * self._size_step_i
+        self.log.info(
+            "TrendLadder ready: symbol=%s market_id=%s size_i(min)=%s size_i(use)=%s price_tick_i=%s size_step_i=%s",
+            self.symbol,
+            self._market_id,
+            min_size_i,
+            self._size_i,
+            self._price_tick_i,
+            self._size_step_i,
+        )
+        if not self._orders:
+            self._immediate_entry = True
+
+    # --------------- normalization helpers ---------------
+    def _order_id_of(self, obj: Dict[str, Any]) -> Optional[str]:
+        for key in ("order_index", "orderIndex", "orderId", "order_id", "id", "i"):
+            val = obj.get(key)
+            if val is None:
+                continue
+            try:
+                sval = str(val).strip()
+                if sval:
+                    return sval
+            except Exception:
+                continue
+        return None
+
+    def _client_order_index_of(self, obj: Dict[str, Any]) -> Optional[int]:
+        for key in (
+            "client_order_index",
+            "clientOrderIndex",
+            "clientId",
+            "clientID",
+            "client_id",
+            "clientid",
+            "c",
+        ):
+            val = obj.get(key)
+            if val is None:
+                continue
+            try:
+                return int(str(val).strip())
+            except Exception:
+                continue
+        return None
+
+    def _order_is_reduce_only(self, obj: Dict[str, Any]) -> bool:
+        for key in ("reduceOnly", "reduce_only", "reduce-only", "reduceonly"):
+            if key in obj:
+                try:
+                    val = obj[key]
+                    if isinstance(val, str):
+                        return val.strip().lower() in {"1", "true", "yes", "on"}
+                    return bool(val)
+                except Exception:
+                    continue
+        return False
+
+    def _order_is_post_only(self, obj: Dict[str, Any]) -> bool:
+        for key in ("postOnly", "post_only", "post-only", "postonly"):
+            if key in obj:
+                try:
+                    val = obj[key]
+                    if isinstance(val, str):
+                        return val.strip().lower() in {"1", "true", "yes", "on"}
+                    return bool(val)
+                except Exception:
+                    continue
+        return False
+
+    def _order_side_label(self, obj: Dict[str, Any]) -> Optional[str]:
+        side = str(obj.get("side", "") or obj.get("S", "")).strip().lower()
+        if not side and obj.get("is_ask") is not None:
+            return "short" if bool(obj.get("is_ask")) else "long"
+        if side in {"sell", "ask", "short", "s"}:
+            return "short"
+        if side in {"buy", "bid", "long", "b"}:
+            return "long"
+        return None
+
+    def _order_price_i(self, obj: Dict[str, Any]) -> Optional[int]:
+        price = obj.get("price") or obj.get("p") or obj.get("avgPrice")
+        if price is None:
+            return None
+        try:
+            if isinstance(price, int):
+                return price
+            return int(round(float(price) * self._price_scale))
+        except Exception:
+            return None
+
+    def _order_amount_i(self, obj: Dict[str, Any]) -> Optional[int]:
+        for key in (
+            "quantity",
+            "qty",
+            "size",
+            "amount",
+            "base_amount",
+            "baseSize",
+            "openQuantity",
+            "origQty",
+        ):
+            val = obj.get(key)
+            if val is None:
+                continue
+            try:
+                if isinstance(val, int):
+                    return val if val >= 0 else None
+                return int(round(float(val) * self._size_scale))
+            except Exception:
+                continue
+        return None
+
+    def _quantize_price_i(self, price_i: int, is_ask: bool) -> int:
+        tick = max(1, int(self._price_tick_i or 1))
+        if tick <= 1:
+            return max(1, price_i)
+        if is_ask:
+            price_i = ((int(price_i) + tick - 1) // tick) * tick
+        else:
+            price_i = (int(price_i) // tick) * tick
+        return max(tick, price_i)
+
+    def _quantize_size_i(self, size_i: int, prefer_up: bool) -> int:
+        step = max(1, int(self._size_step_i or 1))
+        if step <= 1:
+            return max(0, size_i)
+        if prefer_up:
+            size_i = ((int(size_i) + step - 1) // step) * step
+        else:
+            size_i = (int(size_i) // step) * step
+        return max(0, size_i)
+
+    def _has_pending_entry(self, side: str) -> bool:
+        if side == "long":
+            return len(self._entry_cois_long) > 0
+        if side == "short":
+            return len(self._entry_cois_short) > 0
+        return bool(self._entry_cois_long or self._entry_cois_short)
+
+    async def _hydrate_existing_orders(self) -> None:
+        opens = await self.connector.get_open_orders(self.symbol)
+        if not isinstance(opens, list):
+            return
+        restored_entries = restored_tps = 0
+        for order in opens:
+            if not isinstance(order, dict):
+                continue
+            coi = self._client_order_index_of(order)
+            if coi is None or coi in self._orders:
+                continue
+            side = self._order_side_label(order) or self._direction
+            price_i = self._order_price_i(order)
+            size_i = self._order_amount_i(order)
+            order_id = self._order_id_of(order)
+            meta: Dict[str, Any] = {
+                "side": side,
+                "order_index": order_id,
+            }
+            if price_i is not None:
+                meta["entry_price_i"] = price_i
+            if size_i is not None:
+                meta["size_i"] = size_i
+            if self._order_is_reduce_only(order):
+                meta["type"] = "tp"
+                self._tp_cois.add(coi)
+                restored_tps += 1
+            else:
+                meta["type"] = "entry"
+                if side == "long":
+                    self._entry_cois_long.add(coi)
+                else:
+                    self._entry_cois_short.add(coi)
+                restored_entries += 1
+            self._orders[coi] = meta
+        if restored_entries or restored_tps:
+            self.log.info(
+                "hydrated open orders: entries=%s tps=%s", restored_entries, restored_tps
+            )
+        else:
+            self._immediate_entry = True
+        # refresh cached positions so net checks consider persisted exposure
+        try:
+            for pos in await self.connector.get_positions():
+                if not isinstance(pos, dict):
+                    continue
+                sym = str(pos.get("symbol") or pos.get("s") or "").upper()
+                if sym:
+                    self.connector._positions_by_symbol[sym] = pos
+        except Exception:
+            pass
 
     def _trade_amount_i(self, t: Dict[str, Any]) -> int:
-        for key in ("base_amount", "baseAmount", "size", "baseSize", "amount", "quantity"):
+        for key in (
+            "base_amount",
+            "baseAmount",
+            "size",
+            "baseSize",
+            "amount",
+            "quantity",
+            "filledQuantity",
+            "filledQty",
+            "executedQuantity",
+            "executedQty",
+            "filled_size",
+            "filledSize",
+            "q",
+        ):
             v = t.get(key)
             if v is None:
                 continue
@@ -264,7 +535,16 @@ class TrendAdaptiveLadderStrategy(StrategyBase):
         return None
 
     def _trade_coi(self, t: Dict[str, Any]) -> Optional[int]:
-        for k in ("client_order_index","clientOrderIndex","coi"):
+        for k in (
+            "client_order_index",
+            "clientOrderIndex",
+            "clientId",
+            "clientID",
+            "client_id",
+            "clientid",
+            "c",
+            "coi",
+        ):
             v = t.get(k)
             if v is None:
                 continue
@@ -312,15 +592,20 @@ class TrendAdaptiveLadderStrategy(StrategyBase):
                 return
             # place one TP chunk (at most lot size)
             tp_chunk = min(int(self._size_i or self._min_size_i), needed_i)
+            tp_chunk = self._quantize_size_i(tp_chunk, prefer_up=False)
+            if tp_chunk < self._min_size_i:
+                return
             # compute TP price near current book +/- take_profit_abs
             bid, ask, scale = await self.connector.get_top_of_book(self.symbol)
             tp_i = max(1, int(round(self.params.take_profit_abs * self._price_scale)))
+            tick_i = max(1, int(self._price_tick_i or 1))
             if side == "long":
-                price_i = max(1, (ask if ask is not None else (bid + 1 if bid else 1)) + tp_i)
+                price_i = max(1, (ask if ask is not None else (bid + tick_i if bid else tick_i)) + tp_i)
                 is_ask_flag = True
             else:
-                price_i = max(1, (bid if bid is not None else (ask - 1 if ask else 1)) - tp_i)
+                price_i = max(1, (bid if bid is not None else (ask - tick_i if ask else tick_i)) - tp_i)
                 is_ask_flag = False
+            price_i = self._quantize_price_i(price_i, is_ask_flag)
             cio = int(time.time() * 1000) % 1_000_000
             cio, ret, err = await self._place_limit_with_retry(tp_chunk, price_i, is_ask_flag, post_only=True, reduce_only=1)
             if err:
@@ -397,8 +682,17 @@ class TrendAdaptiveLadderStrategy(StrategyBase):
 
     def _net_position_base(self) -> float:
         try:
-            pos = self.connector._positions_by_market.get(int(self._market_id or -1))
-            raw = pos.get("position") if isinstance(pos, dict) else None
+            sym = str(self.symbol or "").upper()
+            pos_map = getattr(self.connector, "_positions_by_symbol", {}) or {}
+            pos = pos_map.get(sym)
+            if not isinstance(pos, dict):
+                return 0.0
+            raw = pos.get("position")
+            if raw is None:
+                for key in ("netQuantity", "quantity", "size", "positionSize"):
+                    if pos.get(key) is not None:
+                        raw = pos.get(key)
+                        break
             return float(raw) if raw is not None else 0.0
         except Exception:
             return 0.0
@@ -547,16 +841,17 @@ class TrendAdaptiveLadderStrategy(StrategyBase):
 
     async def _cancel_all_entries_and_tps(self) -> None:
         opens = await self.connector.get_open_orders(self.symbol)
-        to_cancel: List[int] = []
+        to_cancel: List[str] = []
         for o in opens:
-            try:
-                oi = int(o.get("order_index"))
-            except Exception:
+            if not isinstance(o, dict):
+                continue
+            oi = self._order_id_of(o)
+            if oi is None:
                 continue
             to_cancel.append(oi)
         for oi in to_cancel:
             try:
-                _tx, _ret, err = await self.connector.cancel_order(oi, market_index=self._market_id)
+                _tx, _ret, err = await self.connector.cancel_order(oi, symbol=self.symbol)
                 if err:
                     self.log.warning(f"cancel-all error: oi={oi} err={err}")
             except Exception as e:
@@ -574,20 +869,26 @@ class TrendAdaptiveLadderStrategy(StrategyBase):
         if abs(q) < 1e-9:
             return None
         size_i = max(1, int(round(abs(q) * self._size_scale)))
+        size_i = self._quantize_size_i(size_i, prefer_up=False)
+        if size_i < self._min_size_i:
+            return None
         ticks = 1  # default 1 tick outside best
         try:
             ticks = max(1, int(getattr(self.params, "flush_ticks", 1)))
         except Exception:
             ticks = 1
+        tick_i = max(1, int(self._price_tick_i or 1))
+        offset_i = max(tick_i, int(ticks) * tick_i)
         if q > 0:  # long -> need to sell
-            price_i = max(1, (ask if ask is not None else 1) + ticks)
+            price_i = max(tick_i, (ask if ask is not None else tick_i) + offset_i)
             is_ask = True
             side = "long"
         else:  # short -> need to buy
-            bid0 = bid if bid is not None else (ask - 1 if ask is not None else 1)
-            price_i = max(1, bid0 - ticks)
+            bid0 = bid if bid is not None else (ask - tick_i if ask is not None else tick_i)
+            price_i = max(tick_i, bid0 - offset_i)
             is_ask = False
             side = "short"
+        price_i = self._quantize_price_i(price_i, is_ask)
         cio, ret, err = await self._place_limit_with_retry(size_i, price_i, is_ask, post_only=True, reduce_only=1)
         if err:
             self.log.warning(f"flush TP rejected: {err}")
@@ -603,28 +904,88 @@ class TrendAdaptiveLadderStrategy(StrategyBase):
     async def _place_entry(self, side: str, best_bid: int, best_ask: int) -> Optional[int]:
         assert self._size_i is not None
         # price: just inside book as maker
+        tick = max(1, int(self._price_tick_i or 1))
         if side == "long":
-            price_i = max(1, min(best_bid, best_ask - 1) - 1)
+            ref = best_bid if best_bid is not None else (best_ask - tick if best_ask is not None else tick)
+            ref = max(tick, ref or tick)
+            price_raw_i = max(tick, ref - tick)
             is_ask = False
+            if best_ask is not None:
+                floor_allowed = max(tick, best_ask - tick)
+                if price_raw_i < floor_allowed:
+                    price_raw_i = floor_allowed
         else:
-            price_i = max(best_bid + 1, best_ask + 1)
+            ref = best_ask if best_ask is not None else (best_bid + tick if best_bid is not None else tick)
+            ref = max(tick, ref or tick)
+            price_raw_i = ref + tick
             is_ask = True
-        cio, ret, err = await self._place_limit_with_retry(int(self._size_i), price_i, is_ask, post_only=True, reduce_only=0)
+        price_i = self._quantize_price_i(price_raw_i, is_ask)
+        size_raw_i = int(self._size_i)
+        size_i = self._quantize_size_i(size_raw_i, prefer_up=True)
+        if size_i < self._min_size_i:
+            size_i = self._quantize_size_i(self._min_size_i, prefer_up=True)
+        price_f = price_i / float(self._price_scale or 1)
+        size_f = size_i / float(self._size_scale or 1)
+        mid_f = None
+        if best_bid is not None and best_ask is not None and best_bid > 0 and best_ask > 0:
+            mid_f = ((best_bid + best_ask) / 2.0) / float(self._price_scale or 1)
+        self.log.info(
+            "entry intent: side=%s bid_i=%s ask_i=%s tick_i=%s step_i=%s price_raw_i=%s price_i=%s price=%.8f size_raw_i=%s size_i=%s size=%.8f mid=%.8f",
+            side,
+            best_bid,
+            best_ask,
+            self._price_tick_i,
+            self._size_step_i,
+            price_raw_i,
+            price_i,
+            price_f,
+            size_raw_i,
+            size_i,
+            size_f,
+            mid_f if mid_f is not None else float("nan"),
+        )
+        cio, ret, err = await self._place_limit_with_retry(size_i, price_i, is_ask, post_only=True, reduce_only=0)
         if err:
-            self.log.warning(f"entry {side} rejected: {err}")
+            diff_pct = None
+            if mid_f and mid_f > 0:
+                diff_pct = abs(price_f - mid_f) / mid_f * 100
+            self.log.warning(
+                "entry rejected: side=%s price_i=%s price=%.8f size_i=%s size=%.8f diff_pct=%.4f err=%s",
+                side,
+                price_i,
+                price_f,
+                size_i,
+                size_f,
+                diff_pct if diff_pct is not None else float("nan"),
+                err,
+            )
             return None
         if cio is not None:
             self._orders[cio] = {"type": "entry", "side": side, "entry_price_i": price_i}
             (self._entry_cois_long if side == "long" else self._entry_cois_short).add(cio)
-            self.log.info(f"entry placed: side={side} price_i={price_i} cio={cio}")
+            self.log.info(
+                "entry placed: side=%s price_i=%s price=%.8f size_i=%s size=%.8f cio=%s",
+                side,
+                price_i,
+                price_f,
+                size_i,
+                size_f,
+                cio,
+            )
             return cio
         return None
 
     def _desired_entry_price(self, side: str, best_bid: int, best_ask: int) -> int:
+        tick = max(1, int(self._price_tick_i or 1))
         if side == "long":
-            return max(1, min(best_bid, best_ask - 1) - 1)
-        else:
-            return max(best_bid + 1, best_ask + 1)
+            ref = best_bid if best_bid is not None else (best_ask - tick if best_ask is not None else tick)
+            ref = max(tick, ref or tick)
+            price_i = max(tick, ref - tick)
+            return self._quantize_price_i(price_i, is_ask=False)
+        ref = best_ask if best_ask is not None else (best_bid + tick if best_bid is not None else tick)
+        ref = max(tick, ref or tick)
+        price_i = ref + tick
+        return self._quantize_price_i(price_i, is_ask=True)
 
     async def _requote_stale_entries(self, best_bid: int, best_ask: int) -> int:
         side = self._direction
@@ -641,12 +1002,13 @@ class TrendAdaptiveLadderStrategy(StrategyBase):
             return 0
         # build open entries list for current side
         opens = await self.connector.get_open_orders(self.symbol)
-        targets: List[Tuple[int,int,int,int]] = []  # list of (coi, oi, old_price_i, dist)
+        targets: List[Tuple[int, str, int, int]] = []  # list of (coi, order_id, old_price_i, dist)
         for o in opens:
-            try:
-                coi = int(o.get("client_order_index", -1))
-                oi = int(o.get("order_index", -1))
-            except Exception:
+            if not isinstance(o, dict):
+                continue
+            coi = self._client_order_index_of(o)
+            oi = self._order_id_of(o)
+            if coi is None or oi is None:
                 continue
             meta = self._orders.get(coi)
             if not meta or meta.get("type") != "entry" or meta.get("side") != side:
@@ -687,7 +1049,7 @@ class TrendAdaptiveLadderStrategy(StrategyBase):
                 if new_cio is None:
                     # fallback to cancel-first for this oi
                     try:
-                        _tx, _ret, err = await self.connector.cancel_order(oi, market_index=self._market_id)
+                        _tx, _ret, err = await self.connector.cancel_order(oi, symbol=self.symbol)
                         if err:
                             self.log.warning(f"requote(place-first)->cancel-fallback error: oi={oi} err={err}")
                             c = 1 + int(self._requote_skip_count.get(oi, 0))
@@ -712,7 +1074,7 @@ class TrendAdaptiveLadderStrategy(StrategyBase):
                         continue
                 # cancel old after successfully placing new
                 try:
-                    _tx, _ret, err = await self.connector.cancel_order(oi, market_index=self._market_id)
+                    _tx, _ret, err = await self.connector.cancel_order(oi, symbol=self.symbol)
                     if err:
                         self.log.warning(f"requote(place-first) cancel-error: oi={oi} err={err}")
                     # give ws a short grace period to reflect removal; avoid reprocessing immediately
@@ -738,7 +1100,7 @@ class TrendAdaptiveLadderStrategy(StrategyBase):
                 break
             attempts += 1
             try:
-                _tx, _ret, err = await self.connector.cancel_order(oi, market_index=self._market_id)
+                _tx, _ret, err = await self.connector.cancel_order(oi, symbol=self.symbol)
                 if err:
                     self.log.warning(f"requote-cancel-error: oi={oi} err={err}")
                     # backoff this oi
@@ -764,7 +1126,7 @@ class TrendAdaptiveLadderStrategy(StrategyBase):
             loops = max(1, int(wait_secs / 0.1))
             for _ in range(loops):
                 opens2 = await self.connector.get_open_orders(self.symbol)
-                if not any(int(x.get("order_index", -1)) == oi for x in opens2):
+                if not any(self._order_id_of(x) == oi for x in opens2 if isinstance(x, dict)):
                     removed = True
                     break
                 await asyncio.sleep(0.1)
@@ -773,7 +1135,11 @@ class TrendAdaptiveLadderStrategy(StrategyBase):
                 # extra validation: query REST active orders to verify presence
                 exists = None
                 try:
-                    exists = await self.connector.is_order_open(oi, market_index=self._market_id)
+                    order_info, err = await self.connector.get_order(self.symbol, order_id=oi)
+                    if err == "not_found" or err == "gone":
+                        exists = False
+                    else:
+                        exists = bool(order_info)
                 except Exception:
                     exists = None
                 if exists is False:
@@ -795,7 +1161,7 @@ class TrendAdaptiveLadderStrategy(StrategyBase):
                         removed = True
                         # best-effort: fire a background cancel attempt again
                         try:
-                            asyncio.create_task(self.connector.cancel_order(oi, market_index=self._market_id))
+                            asyncio.create_task(self.connector.cancel_order(oi, symbol=self.symbol))
                         except Exception:
                             pass
                         # mark long backoff to avoid hammering
@@ -839,6 +1205,11 @@ class TrendAdaptiveLadderStrategy(StrategyBase):
         else:
             price_i = max(1, entry_price_i - tp_i)
             is_ask = False
+        price_i = self._quantize_price_i(price_i, is_ask)
+        size_i = self._quantize_size_i(int(self._size_i), prefer_up=False)
+        if size_i < self._min_size_i:
+            size_i = self._quantize_size_i(self._min_size_i, prefer_up=True)
+        size_i = max(self._min_size_i, size_i)
         # intent log
         try:
             self.log.info(
@@ -847,7 +1218,7 @@ class TrendAdaptiveLadderStrategy(StrategyBase):
             )
         except Exception:
             pass
-        cio, ret, err = await self._place_limit_with_retry(int(self._size_i), price_i, is_ask, post_only=True, reduce_only=1)
+        cio, ret, err = await self._place_limit_with_retry(size_i, price_i, is_ask, post_only=True, reduce_only=1)
         if err:
             self.log.warning(f"tp for {side} rejected: {err}")
             return None
@@ -862,14 +1233,26 @@ class TrendAdaptiveLadderStrategy(StrategyBase):
                     # WS presence by COI
                     try:
                         opens = await self.connector.get_open_orders(self.symbol)
-                        ws_hit = any(int(o.get("client_order_index", -1)) == int(cio) for o in opens)
+                        ws_hit = any(
+                            self._client_order_index_of(o) == int(cio)
+                            for o in opens
+                            if isinstance(o, dict)
+                        )
                         from collections import Counter
-                        ws_hist = Counter(str(o.get("status", "")).strip().lower() for o in opens)
+                        ws_hist = Counter(
+                            str(o.get("status", "")).strip().lower()
+                            for o in opens
+                            if isinstance(o, dict)
+                        )
                     except Exception:
                         ws_hit, ws_hist = False, {}
                     # REST presence by COI (market-aware)
                     try:
-                        rest_hit = await self.connector.is_coi_open(int(cio), market_index=self._market_id)
+                        order_info, err = await self.connector.get_order(self.symbol, client_id=int(cio))
+                        if err in {"not_found", "gone"}:
+                            rest_hit = False
+                        else:
+                            rest_hit = bool(order_info)
                     except Exception:
                         rest_hit = None
                     self.log.info(
@@ -898,6 +1281,11 @@ class TrendAdaptiveLadderStrategy(StrategyBase):
         Returns: (total_i, count_matched, count_total)
         """
         def _infer_is_ask(o: Dict[str, Any]) -> bool:
+            label = self._order_side_label(o)
+            if label == "short":
+                return True
+            if label == "long":
+                return False
             v = o.get("is_ask")
             if v is None:
                 v = o.get("isAsk")
@@ -941,11 +1329,16 @@ class TrendAdaptiveLadderStrategy(StrategyBase):
         total = 0
         matched = 0
         for o in opens:
+            if not isinstance(o, dict):
+                continue
             is_ask = _infer_is_ask(o)
             if need_sell != is_ask:
                 continue
             matched += 1
-            total += _amount_i(o)
+            amt_i = self._order_amount_i(o)
+            if amt_i is None:
+                amt_i = _amount_i(o)
+            total += amt_i
         return total, matched, len(opens)
 
     async def _tp_coverage_check_and_correct(self, bid: int, ask: int) -> bool:
@@ -981,16 +1374,24 @@ class TrendAdaptiveLadderStrategy(StrategyBase):
                 self.log.info("imbalance correction rate-limited; will retry later")
                 return False
             tp_i = max(1, int(round(self.params.take_profit_abs * self._price_scale)))
+            tick_i = max(1, int(self._price_tick_i or 1))
             for _ in range(to_place):
                 if q_base > 0:  # long -> place sell reduce-only
-                    price_i = max(1, (ask if ask is not None else (bid + 1 if bid else 1)) + tp_i)
+                    price_i = max(1, (ask if ask is not None else (bid + tick_i if bid else tick_i)) + tp_i)
                     is_ask_flag = True
                     side = "long"
                 else:  # short -> place buy reduce-only
-                    price_i = max(1, (bid if bid is not None else (ask - 1 if ask else 1)) - tp_i)
+                    price_i = max(1, (bid if bid is not None else (ask - tick_i if ask else tick_i)) - tp_i)
                     is_ask_flag = False
                     side = "short"
+                price_i = self._quantize_price_i(price_i, is_ask_flag)
                 amt_i = min(int(self._size_i or self._min_size_i), max(self._min_size_i, deficit_i))
+                amt_i = self._quantize_size_i(amt_i, prefer_up=False)
+                if amt_i < self._min_size_i:
+                    amt_i = self._quantize_size_i(self._min_size_i, prefer_up=True)
+                if amt_i < self._min_size_i:
+                    self.log.info("imbalance TP skipped due to size below min lot")
+                    break
                 cio = int(time.time() * 1000) % 1_000_000
                 cio, ret, err = await self._place_limit_with_retry(amt_i, price_i, is_ask_flag, post_only=True, reduce_only=1)
                 if err:
@@ -1019,22 +1420,21 @@ class TrendAdaptiveLadderStrategy(StrategyBase):
 
     async def _cancel_side_entries(self, side: str) -> None:
         opens = await self.connector.get_open_orders(self.symbol)
-        to_cancel: List[int] = []
+        to_cancel: List[str] = []
         for o in opens:
-            try:
-                coi = int(o.get("client_order_index", -1))
-            except Exception:
+            if not isinstance(o, dict):
+                continue
+            coi = self._client_order_index_of(o)
+            if coi is None:
                 continue
             meta = self._orders.get(coi)
             if meta and meta.get("type") == "entry" and meta.get("side") == side:
-                try:
-                    oi = int(o.get("order_index"))
+                oi = self._order_id_of(o)
+                if oi is not None:
                     to_cancel.append(oi)
-                except Exception:
-                    pass
         for oi in to_cancel:
             try:
-                _tx, _ret, err = await self.connector.cancel_order(oi, market_index=self._market_id)
+                _tx, _ret, err = await self.connector.cancel_order(oi, symbol=self.symbol)
                 if err:
                     self.log.warning(f"cancel-side error: side={side} oi={oi} err={err}")
             except Exception as e:
@@ -1042,7 +1442,12 @@ class TrendAdaptiveLadderStrategy(StrategyBase):
         if to_cancel:
             for _ in range(30):
                 opens2 = await self.connector.get_open_orders(self.symbol)
-                if not any(self._orders.get(int(x.get("client_order_index", -1)), {}).get("type") == "entry" and self._orders.get(int(x.get("client_order_index", -1)), {}).get("side") == side for x in opens2):
+                if not any(
+                    self._orders.get(self._client_order_index_of(x) or -1, {}).get("type") == "entry"
+                    and self._orders.get(self._client_order_index_of(x) or -1, {}).get("side") == side
+                    for x in opens2
+                    if isinstance(x, dict)
+                ):
                     break
                 await asyncio.sleep(0.1)
 
@@ -1091,6 +1496,12 @@ class TrendAdaptiveLadderStrategy(StrategyBase):
         except Exception:
             pass
 
+        if self._last_entry_time <= 0:
+            self.log.info(
+                f"wait-calc: active_close={active_close}/{max_orders} ratio={ratio:.2f} cool_down={cool_down:.1f}s elapsed=NA(no fills yet)"
+            )
+            return 0
+
         elapsed = time.time() - float(self._last_entry_time)
         self.log.info(
             f"wait-calc: active_close={active_close}/{max_orders} ratio={ratio:.2f} cool_down={cool_down:.1f}s elapsed={elapsed:.1f}s"
@@ -1106,18 +1517,9 @@ class TrendAdaptiveLadderStrategy(StrategyBase):
             return
         await self._ensure_ready()
 
-        # one-time cleanup
-        if not self._did_initial_cleanup:
-            try:
-                await self.connector.cancel_all()
-            except Exception:
-                pass
-            for _ in range(50):
-                o2 = await self.connector.get_open_orders(self.symbol)
-                if len(o2) == 0:
-                    break
-                await asyncio.sleep(0.1)
-            self._did_initial_cleanup = True
+        if not self._hydrated_open_orders:
+            await self._hydrate_existing_orders()
+            self._hydrated_open_orders = True
 
         bid, ask, scale = await self.connector.get_top_of_book(self.symbol)
         if bid is None or ask is None or scale <= 0:
@@ -1172,8 +1574,9 @@ class TrendAdaptiveLadderStrategy(StrategyBase):
         # cap by active close orders (positions needing TP)
         if len(self._tp_cois) >= self.params.max_orders:
             return
+        if self._has_pending_entry(self._direction):
+            self.log.debug("entry skip: pending entry order exists for side=%s", self._direction)
+            return
         if self._immediate_entry or self._calculate_wait_time() == 0:
             cio = await self._place_entry(self._direction, best_bid=bid, best_ask=ask)
-            if cio is not None:
-                self._last_entry_time = time.time()
             self._immediate_entry = False
