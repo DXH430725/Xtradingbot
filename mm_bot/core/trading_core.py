@@ -198,11 +198,23 @@ class TradingCore:
             try:
                 stop = getattr(conn, "stop", None)
                 if callable(stop):
-                    stop(self)
+                    res = stop(self)
+                    if asyncio.iscoroutine(res):
+                        await res
                 self.dbg(f"Connector stopped: {name}")
             except Exception:
                 self.logger.error(f"Error stopping connector {name}")
                 self.dbg("connector.stop exception", exc_info=True)
+            try:
+                close = getattr(conn, "close", None)
+                if callable(close):
+                    res = close()
+                    if asyncio.iscoroutine(res):
+                        await res
+                self.dbg(f"Connector closed: {name}")
+            except Exception:
+                self.logger.error(f"Error closing connector {name}")
+                self.dbg("connector.close exception", exc_info=True)
 
         self._is_running = False
         self.logger.info("TradingCore stopped")

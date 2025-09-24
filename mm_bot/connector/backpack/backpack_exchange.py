@@ -93,9 +93,11 @@ class BackpackConnector(BaseConnector):
         self._started = True
 
     async def close(self):
+        await self.stop_ws_state()
         if self._session:
             await self._session.close()
             self._session = None
+        self._started = False
 
     # event handlers ----------------------------------------------------------
     def set_event_handlers(
@@ -326,7 +328,66 @@ class BackpackConnector(BaseConnector):
         ask_i = _to_i(asks[0][0]) if asks else None
         return bid_i, ask_i, scale
 
+    async def get_last_price(self, symbol: str) -> Optional[float]:
+        await self._ensure_markets()
+        params = {"symbol": symbol}
+        await self._throttler.acquire("/api/v1/ticker")
+        async with self._session.get(
+            self.config.base_url + "/api/v1/ticker",
+            params=params,
+            headers={"X-BROKER-ID": self._broker_id},
+            timeout=10,
+        ) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+        if isinstance(data, dict):
+            price = data.get("lastPrice") or data.get("last_price") or data.get("price")
+            try:
+                return float(price)
+            except (TypeError, ValueError):
+                return None
+        return None
+
     # orders ------------------------------------------------------------------
+    def _interpret_execution_response(self, payload: Any) -> Tuple[Optional[str], Optional[str]]:
+        if not isinstance(payload, dict):
+            return None, "invalid_response"
+
+        order_section: Dict[str, Any] = payload
+        nested = payload.get("order")
+        if isinstance(nested, dict):
+            order_section = nested
+
+        order_id = (
+            order_section.get("id")
+            or order_section.get("orderId")
+            or order_section.get("order_id")
+        )
+
+        status_raw = order_section.get("status", payload.get("status"))
+        status = str(status_raw).lower() if status_raw is not None else ""
+        code = payload.get("code")
+
+        success = False
+        if order_id is not None:
+            success = True
+        elif code in {0, "0", 200, "200"}:
+            success = True
+        elif status in {"success", "ok", "accepted", "open", "new", "working"}:
+            success = True
+
+        if success:
+            return (str(order_id) if order_id is not None else None), None
+
+        message = (
+            payload.get("message")
+            or payload.get("error")
+            or order_section.get("message")
+            or order_section.get("error")
+        )
+        return None, str(message) if message is not None else "order_rejected"
+
     async def place_limit(
         self,
         symbol: str,
@@ -387,7 +448,7 @@ class BackpackConnector(BaseConnector):
                     info={"error": err_msg},
                 )
                 return None, None, err_msg
-        err = None if (isinstance(ret, dict) and ret.get("id")) else (ret.get("message") if isinstance(ret, dict) else "unknown")
+        order_id, err = self._interpret_execution_response(ret)
         if err:
             self._update_order_state(
                 client_order_id=client_order_index,
@@ -397,10 +458,9 @@ class BackpackConnector(BaseConnector):
                 info=ret if isinstance(ret, dict) else {"error": err},
             )
             return ret, ret, err
-        order_id = ret.get("id") if isinstance(ret, dict) else None
         self._update_order_state(
             client_order_id=client_order_index,
-            exchange_order_id=str(order_id) if order_id is not None else None,
+            exchange_order_id=order_id,
             symbol=symbol,
             is_ask=is_ask,
             state=OrderState.OPEN,
@@ -489,7 +549,7 @@ class BackpackConnector(BaseConnector):
                     info={"error": err_msg},
                 )
                 return None, None, err_msg
-        err = None if (isinstance(ret, dict) and ret.get("id")) else (ret.get("message") if isinstance(ret, dict) else "unknown")
+        order_id, err = self._interpret_execution_response(ret)
         if err:
             self._update_order_state(
                 client_order_id=client_order_index,
@@ -499,10 +559,9 @@ class BackpackConnector(BaseConnector):
                 info=ret if isinstance(ret, dict) else {"error": err},
             )
             return ret, ret, err
-        order_id = ret.get("id") if isinstance(ret, dict) else None
         self._update_order_state(
             client_order_id=client_order_index,
-            exchange_order_id=str(order_id) if order_id is not None else None,
+            exchange_order_id=order_id,
             symbol=symbol,
             is_ask=is_ask,
             state=OrderState.FILLED,  # market assumed immediate

@@ -417,23 +417,66 @@ def build_smoke_test_strategy(cfg: Dict[str, Any], connectors: Dict[str, Any], g
     from mm_bot.strategy.smoke_test import ConnectorSmokeTestStrategy, SmokeTestParams, ConnectorTestConfig
 
     connector_cfg = get_dict(cfg, "connectors")
+    default_symbol = get_str(general, "symbol", env="XTB_SYMBOL", default="BTC_USDC_PERP")
     mapped: Dict[str, ConnectorTestConfig] = {}
     for name, data in connector_cfg.items():
         if not isinstance(data, dict):
             continue
+        limit_timeout = get_float(data, "limit_timeout_secs", default=20.0)
+        if limit_timeout is None:
+            limit_timeout = 20.0
+        settle_timeout = get_float(data, "settle_timeout_secs", default=10.0)
+        if settle_timeout is None:
+            settle_timeout = 10.0
+        price_offset = get_int(data, "price_offset_ticks", default=0)
+        if price_offset is None:
+            price_offset = 0
+        max_price_retries = get_int(data, "max_price_retries", default=1)
+        if max_price_retries is None:
+            max_price_retries = 1
+        retry_cooldown = get_float(data, "retry_cooldown_secs", default=0.5)
+        if retry_cooldown is None:
+            retry_cooldown = 0.5
         mapped[name] = ConnectorTestConfig(
-            symbol=str(data.get("symbol", get_str(general, "symbol", env="XTB_SYMBOL", default="BTC_USDC_PERP"))),
+            symbol=str(data.get("symbol", default_symbol)),
             side=str(data.get("side", "buy")),
-            limit_timeout_secs=get_float(data, "limit_timeout_secs", default=20.0) or 20.0,
-            settle_timeout_secs=get_float(data, "settle_timeout_secs", default=10.0) or 10.0,
-            price_offset_ticks=get_int(data, "price_offset_ticks", default=0) or 0,
+            limit_timeout_secs=limit_timeout,
+            settle_timeout_secs=settle_timeout,
+            price_offset_ticks=price_offset,
+            max_price_retries=max_price_retries,
+            retry_cooldown_secs=retry_cooldown,
         )
+    pause_between = get_float(cfg, "pause_between_tests_secs", default=2.0)
+    if pause_between is None:
+        pause_between = 2.0
     params = SmokeTestParams(
         connectors=mapped,
-        pause_between_tests_secs=get_float(cfg, "pause_between_tests_secs", default=2.0) or 2.0,
+        pause_between_tests_secs=pause_between,
     )
     active_connectors = {name: connectors[name] for name in mapped.keys() if name in connectors}
     return ConnectorSmokeTestStrategy(connectors=active_connectors, params=params)
+
+
+async def prepare_smoke_test(connectors: Dict[str, Any], strategy_cfg: Dict[str, Any], general: Dict[str, Any]) -> None:
+    connector_cfg = get_dict(strategy_cfg, "connectors")
+    default_symbol = get_str(general, "symbol", env="XTB_SYMBOL", default="BTC_USDC_PERP")
+    for name, connector in connectors.items():
+        if not connector:
+            continue
+        start_ws = getattr(connector, "start_ws_state", None)
+        if not callable(start_ws):
+            continue
+        cfg = connector_cfg.get(name, {}) if isinstance(connector_cfg, dict) else {}
+        symbol = cfg.get("symbol") if isinstance(cfg, dict) else None
+        targets: List[str] = []
+        if symbol:
+            targets = [str(symbol)]
+        elif default_symbol:
+            targets = [str(default_symbol)]
+        try:
+            await start_ws(targets)
+        except TypeError:
+            await start_ws()
 
 
 async def prepare_cross_arb(connectors: Dict[str, Any], strategy_cfg: Dict[str, Any], general: Dict[str, Any]) -> None:
@@ -496,6 +539,7 @@ STRATEGY_BUILDERS: Dict[str, Dict[str, Any]] = {
         "factory": build_smoke_test_strategy,
         "requires": [],
         "resolve_connectors": _resolve_smoke_connectors,
+        "prepare": prepare_smoke_test,
         "description": "Connector smoke test",
     },
 }

@@ -12,4 +12,4 @@ ps aux | grep run_trend_ladder.py
 
  python mm_bot/bin/run_cross_arb.py
 
-XTB_CONFIG=mm_bot/conf/smoke_test.yaml
+XTB_CONFIG=mm_bot/conf/smoke_test.yaml python mm_bot/bin/runner.py --strategy smoke_test
