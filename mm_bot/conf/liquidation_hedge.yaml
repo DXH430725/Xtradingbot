@@ -1,0 +1,31 @@
+general:
+  log_config: mm_bot/conf/logging.yaml
+
+connectors:
+  backpack:
+    base_url: https://api.backpack.exchange
+    ws_url: wss://ws.backpack.exchange
+    keys_file: Backpack_key.txt
+    broker_id: "1500"
+  lighter:
+    base_url: https://mainnet.zklighter.elliot.ai
+    keys_file: Lighter_key.txt
+    account_index: null
+    rpm: 4000
+
+strategy:
+  name: liquidation_hedge
+  liquidation_hedge:
+    backpack_symbol: ETH_USDC_PERP
+    lighter_symbol: ETH
+    direction: long_backpack
+    leverage: 50.0
+    price_offset_ticks: 1
+    tracking_cancel_wait_secs: 2.0
+    tracking_post_only: true
+    timeout_secs: 86400.0
+    poll_interval_secs: 5.0
+    reduce_only_buffer_ticks: 5
+    reverse_on_timeout: true
+    max_cycles: 1
+    min_collateral: 0.0

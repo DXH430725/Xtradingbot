@@ -80,6 +80,14 @@ async def place_tracking_limit_order(
 
         if logger:
             logger.info(
+                "tracking_limit book symbol=%s bid_i=%s ask_i=%s bid=%s ask=%s",
+                symbol,
+                bid_i,
+                ask_i,
+                _format_price(bid_i, scale),
+                _format_price(ask_i, scale),
+            )
+            logger.info(
                 "tracking_limit attempt=%s symbol=%s side=%s price_i=%s size_i=%s",
                 attempts,
                 symbol,
@@ -186,6 +194,15 @@ def _select_price(
     if ask_i is not None:
         price = min(price, max(ask_i - 1, 1))
     return max(price, 1)
+
+
+def _format_price(value_i: Optional[int], scale: int) -> str:
+    if value_i is None or scale <= 0:
+        return "?"
+    try:
+        return f"{value_i / scale:.8f}"
+    except Exception:
+        return str(value_i)
 
 
 async def _submit_limit(

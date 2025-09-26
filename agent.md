@@ -40,3 +40,4 @@ Whenever you finish the day’s tasks:
 - Enable verbose connector logs via `general.debug: true` or `XTB_DEBUG=1`.
 - Tracking limit diagnostics assume connectors implement `get_market_info`, `get_price_size_decimals`, `submit_limit_order`/`submit_market_order`, and `get_positions`.
 - Maintain small, composable modules; prefer dependency injection to keep components testable.
+- 除非用户明确要求，严禁使用 `git update` 从本地状态回滚或覆盖仓库内容。

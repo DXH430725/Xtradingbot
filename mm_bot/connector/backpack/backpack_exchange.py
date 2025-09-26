@@ -69,6 +69,9 @@ class BackpackConnector(BaseConnector):
         # ws state
         self._ws_task: Optional[asyncio.Task] = None
         self._ws_stop: bool = False
+        self._top_of_book_cache: Dict[str, Tuple[Optional[int], Optional[int], int, float]] = {}
+        self._top_of_book_events: Dict[str, asyncio.Event] = {}
+        self._depth_state: Dict[str, Dict[str, Any]] = {}
 
         # simple caches fed by private WS
         self._positions_by_symbol: Dict[str, Dict[str, Any]] = {}
@@ -306,27 +309,28 @@ class BackpackConnector(BaseConnector):
 
     async def get_top_of_book(self, symbol: str) -> Tuple[Optional[int], Optional[int], int]:
         await self._ensure_markets()
-        p_dec, _s_dec = await self.get_price_size_decimals(symbol)
-        params = {"symbol": symbol, "limit": 1}
-        await self._throttler.acquire("/api/v1/depth")
-        async with self._session.get(
-            self.config.base_url + "/api/v1/depth",
-            params=params,
-            headers={"X-BROKER-ID": self._broker_id},
-            timeout=10,
-        ) as resp:
-            data = await resp.json()
-        bids = data.get("bids") or []
-        asks = data.get("asks") or []
-        scale = 10 ** int(p_dec)
-        def _to_i(x: Any) -> Optional[int]:
+        key = str(symbol).upper()
+        cached = self._top_of_book_cache.get(key)
+        now = time.monotonic()
+        if cached and now - cached[3] <= 3.0:
+            return cached[0], cached[1], cached[2]
+        event = self._top_of_book_events.get(key)
+        if event and not event.is_set():
             try:
-                return int(round(float(x) * scale))
-            except Exception:
-                return None
-        bid_i = _to_i(bids[0][0]) if bids else None
-        ask_i = _to_i(asks[0][0]) if asks else None
-        return bid_i, ask_i, scale
+                await asyncio.wait_for(event.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                pass
+            cached = self._top_of_book_cache.get(key)
+            now = time.monotonic()
+            if cached and now - cached[3] <= 3.0:
+                return cached[0], cached[1], cached[2]
+        await self._load_depth_snapshot(key)
+        cached = self._top_of_book_cache.get(key)
+        if cached:
+            return cached[0], cached[1], cached[2]
+        p_dec, _s_dec = await self.get_price_size_decimals(symbol)
+        scale = 10 ** int(p_dec)
+        return None, None, scale
 
     async def get_last_price(self, symbol: str) -> Optional[float]:
         await self._ensure_markets()
@@ -718,8 +722,15 @@ class BackpackConnector(BaseConnector):
     async def start_ws_state(self, symbols: Optional[List[str]] = None):
         if self._ws_task and not self._ws_task.done():
             return
+        targets = [str(s).upper() for s in (symbols or []) if s]
+        for sym in targets:
+            self._top_of_book_events[sym] = asyncio.Event()
+            self._top_of_book_cache.pop(sym, None)
+            self._depth_state.pop(sym, None)
+        if targets:
+            await asyncio.gather(*(self._prime_depth_cache(sym) for sym in targets))
         self._ws_stop = False
-        self._ws_task = asyncio.create_task(self._ws_loop(symbols or []), name="backpack_ws")
+        self._ws_task = asyncio.create_task(self._ws_loop(targets), name="backpack_ws")
 
     async def stop_ws_state(self):
         self._ws_stop = True
@@ -768,6 +779,9 @@ class BackpackConnector(BaseConnector):
                             if isinstance(payload, dict):
                                 self._handle_private_position_event(payload)
                         if handled:
+                            continue
+                        if stream.startswith("depth.") or str(payload.get("e", "")).lower() == "depth":
+                            await self._handle_depth_event(payload)
                             continue
                         if stream.endswith("orderupdate") or (isinstance(payload, dict) and (payload.get("id") or payload.get("clientId"))):
                             if isinstance(payload, dict):
@@ -881,3 +895,170 @@ class BackpackConnector(BaseConnector):
             normalized["symbol"] = symbol
             self._positions_by_symbol[str(symbol).upper()] = normalized
         self.emit_position(normalized)
+
+    # ------------------------------------------------------------------
+    # Order book helpers
+    # ------------------------------------------------------------------
+    async def _prime_depth_cache(self, symbol: str) -> None:
+        try:
+            await self._load_depth_snapshot(symbol)
+        except Exception as exc:
+            self.log.warning("%s depth snapshot failed: %s", symbol, exc)
+
+    async def _load_depth_snapshot(self, symbol: str) -> None:
+        await self._ensure_markets()
+        params = {"symbol": symbol, "limit": 200}
+        await self._throttler.acquire("/api/v1/depth")
+        async with self._session.get(
+            self.config.base_url + "/api/v1/depth",
+            params=params,
+            headers={"X-BROKER-ID": self._broker_id},
+            timeout=10,
+        ) as resp:
+            data = await resp.json()
+        bids = data.get("bids") or []
+        asks = data.get("asks") or []
+        last_update_id = data.get("lastUpdateId")
+        scale = self._resolve_depth_scale(symbol, asks, bids)
+        state = self._depth_state.setdefault(
+            symbol,
+            {"scale": scale, "bids": {}, "asks": {}, "last_update_id": 0},
+        )
+        state["scale"] = scale
+        state["bids"] = self._levels_to_map(bids, scale)
+        state["asks"] = self._levels_to_map(asks, scale)
+        try:
+            state["last_update_id"] = int(last_update_id)
+        except (TypeError, ValueError):
+            state["last_update_id"] = 0
+        bid_i = self._best_bid(state)
+        ask_i = self._best_ask(state)
+        ts = time.monotonic()
+        self._top_of_book_cache[symbol] = (bid_i, ask_i, scale, ts)
+        event = self._top_of_book_events.get(symbol)
+        if event and not event.is_set():
+            event.set()
+
+    async def _handle_depth_event(self, payload: Dict[str, Any]) -> None:
+        symbol_raw = payload.get("s") or payload.get("symbol")
+        if not symbol_raw:
+            return
+        symbol = str(symbol_raw).upper()
+        state = self._depth_state.get(symbol)
+        if state is None:
+            await self._load_depth_snapshot(symbol)
+            state = self._depth_state.get(symbol)
+            if state is None:
+                return
+        bids = payload.get("b") or payload.get("bids") or []
+        asks = payload.get("a") or payload.get("asks") or []
+        first_id = self._safe_int(payload.get("U"))
+        last_id = self._safe_int(payload.get("u"))
+        prev = state.get("last_update_id", 0)
+        if last_id is not None and prev and last_id <= prev:
+            return
+        if first_id is not None and prev and first_id > prev + 1:
+            await self._load_depth_snapshot(symbol)
+            state = self._depth_state.get(symbol)
+            if state is None:
+                return
+        scale = state.get("scale", self._resolve_depth_scale(symbol, asks, bids))
+        if bids:
+            self._apply_depth_levels(state["bids"], bids, scale)
+        if asks:
+            self._apply_depth_levels(state["asks"], asks, scale)
+        if last_id is not None:
+            state["last_update_id"] = last_id
+        bid_i = self._best_bid(state)
+        ask_i = self._best_ask(state)
+        if bid_i is None and ask_i is None:
+            return
+        ts = time.monotonic()
+        self._top_of_book_cache[symbol] = (bid_i, ask_i, scale, ts)
+        event = self._top_of_book_events.get(symbol)
+        if event and not event.is_set():
+            event.set()
+
+    def _resolve_depth_scale(self, symbol: str, asks: Any, bids: Any) -> int:
+        decimals = self._price_decimals.get(symbol)
+        if decimals is not None:
+            try:
+                return 10 ** int(decimals)
+            except Exception:
+                pass
+        candidate = self._first_price_value(asks)
+        if candidate is None:
+            candidate = self._first_price_value(bids)
+        if candidate is not None:
+            text = str(candidate)
+            if "." in text:
+                try:
+                    return 10 ** len(text.split(".", 1)[1])
+                except Exception:
+                    pass
+        return 1
+
+    def _first_price_value(self, entries: Any) -> Optional[Any]:
+        if not isinstance(entries, list):
+            return None
+        for item in entries:
+            if isinstance(item, (list, tuple)) and item:
+                return item[0]
+        return None
+
+    def _levels_to_map(self, entries: Any, scale: int) -> Dict[int, float]:
+        out: Dict[int, float] = {}
+        if not isinstance(entries, list):
+            return out
+        for item in entries:
+            if not isinstance(item, (list, tuple)) or len(item) < 2:
+                continue
+            price_i = self._price_to_int(item[0], scale)
+            if price_i is None:
+                continue
+            qty = self._safe_float(item[1])
+            if qty is None or qty <= 0:
+                continue
+            out[price_i] = qty
+        return out
+
+    def _apply_depth_levels(self, book: Dict[int, float], updates: Any, scale: int) -> None:
+        if not isinstance(updates, list):
+            return
+        for item in updates:
+            if not isinstance(item, (list, tuple)) or len(item) < 2:
+                continue
+            price_i = self._price_to_int(item[0], scale)
+            if price_i is None:
+                continue
+            qty = self._safe_float(item[1])
+            if qty is None or qty <= 0:
+                book.pop(price_i, None)
+            else:
+                book[price_i] = qty
+
+    def _price_to_int(self, value: Any, scale: int) -> Optional[int]:
+        try:
+            return int(round(float(value) * scale))
+        except (TypeError, ValueError):
+            return None
+
+    def _safe_float(self, value: Any) -> Optional[float]:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _safe_int(self, value: Any) -> Optional[int]:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _best_bid(self, state: Dict[str, Any]) -> Optional[int]:
+        bids = state.get("bids", {})
+        return max(bids.keys()) if bids else None
+
+    def _best_ask(self, state: Dict[str, Any]) -> Optional[int]:
+        asks = state.get("asks", {})
+        return min(asks.keys()) if asks else None

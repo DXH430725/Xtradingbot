@@ -190,7 +190,7 @@ class ConnectorSmokeTestStrategy(StrategyBase):
             self._record_failure(name, detail)
             return False
 
-        await self._verify_connector_health(name, connector, cfg.symbol)
+        await self._verify_connector_health(name, connector, cfg)
         await asyncio.sleep(self.params.pause_between_tests_secs)
         self._record_success(name)
         return True
@@ -274,12 +274,12 @@ class ConnectorSmokeTestStrategy(StrategyBase):
                         continue
         return fallback
 
-    async def _verify_connector_health(self, name: str, connector: Any, symbol: str) -> None:
+    async def _verify_connector_health(self, name: str, connector: Any, cfg: ConnectorTestConfig) -> None:
         open_orders: List[Dict[str, Any]] = []
         rest_fn = getattr(connector, "get_open_orders", None)
         if callable(rest_fn):
             try:
-                open_orders = await rest_fn(symbol)
+                open_orders = await rest_fn(cfg.symbol)
             except TypeError:
                 open_orders = await rest_fn()
             except Exception as exc:
@@ -293,6 +293,15 @@ class ConnectorSmokeTestStrategy(StrategyBase):
             for sym, qty, _ in positions
             if sym and qty is not None and abs(float(qty)) > POSITION_TOLERANCE
         ]
+        if exposures and cfg.settle_timeout_secs > 0:
+            post_wait = max(min(cfg.settle_timeout_secs, 2.0), 0.2)
+            await asyncio.sleep(post_wait)
+            positions = await self._fetch_positions(connector)
+            exposures = [
+                (sym, qty)
+                for sym, qty, _ in positions
+                if sym and qty is not None and abs(float(qty)) > POSITION_TOLERANCE
+            ]
         if exposures:
             self._record_failure(name, f"positions still open: {self._format_positions_summary(positions)}")
 
@@ -309,6 +318,10 @@ class ConnectorSmokeTestStrategy(StrategyBase):
             if not connector:
                 continue
             cfg = self.params.connectors.get(name)
+            settle_raw = (cfg.settle_timeout_secs if cfg else 0.0)
+            settle_wait = max(min(settle_raw, 2.0), 0.0)
+            if settle_wait > 0:
+                await asyncio.sleep(settle_wait)
             positions_before = await self._fetch_positions(connector)
             summary_before = self._format_positions_summary(positions_before)
             if summary_before:
@@ -382,7 +395,8 @@ class ConnectorSmokeTestStrategy(StrategyBase):
                 )
                 if tracker is None:
                     success = False
-            await asyncio.sleep(0.5)
+            wait_after = max(settle_wait, 0.5)
+            await asyncio.sleep(wait_after)
         positions = await self._fetch_positions(connector)
         if any(
             symbol and qty is not None and abs(float(qty)) > POSITION_TOLERANCE for symbol, qty, _ in positions

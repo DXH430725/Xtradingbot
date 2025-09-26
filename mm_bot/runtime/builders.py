@@ -347,6 +347,38 @@ def build_as_model_strategy(cfg: Dict[str, Any], connectors: Dict[str, Any], gen
     return AvellanedaStoikovStrategy(connector=connector, symbol=symbol, params=params)
 
 
+def build_liquidation_hedge_strategy(cfg: Dict[str, Any], connectors: Dict[str, Any], general: Dict[str, Any]) -> Any:
+    from mm_bot.strategy.liquidation_hedge import LiquidationHedgeParams, LiquidationHedgeStrategy
+
+    params_cfg = get_dict(cfg, "liquidation_hedge") or cfg
+    leverage = get_float(params_cfg, "leverage", default=50.0) or 50.0
+    price_offset = int(get_float(params_cfg, "price_offset_ticks", default=1) or 1)
+    timeout_secs = get_float(params_cfg, "timeout_secs", default=24 * 3600.0) or (24 * 3600.0)
+    poll_secs = get_float(params_cfg, "poll_interval_secs", default=5.0) or 5.0
+    reduce_buffer = int(get_float(params_cfg, "reduce_only_buffer_ticks", default=5) or 5)
+    reverse_on_timeout = get_bool(params_cfg, "reverse_on_timeout", default=True)
+    max_cycles = int(get_float(params_cfg, "max_cycles", default=1) or 1)
+    tracking_post_only = get_bool(params_cfg, "tracking_post_only", default=True)
+    params = LiquidationHedgeParams(
+        backpack_symbol=get_str(params_cfg, "backpack_symbol", default="ETH_USDC_PERP") or "ETH_USDC_PERP",
+        lighter_symbol=get_str(params_cfg, "lighter_symbol", default="ETH") or "ETH",
+        leverage=leverage,
+        direction=get_str(params_cfg, "direction", default="long_backpack") or "long_backpack",
+        price_offset_ticks=price_offset,
+        tracking_cancel_wait_secs=get_float(params_cfg, "tracking_cancel_wait_secs", default=2.0) or 2.0,
+        tracking_post_only=tracking_post_only,
+        timeout_secs=timeout_secs,
+        poll_interval_secs=poll_secs,
+        reduce_only_buffer_ticks=reduce_buffer,
+        reverse_on_timeout=reverse_on_timeout,
+        max_cycles=max_cycles,
+        min_collateral=get_float(params_cfg, "min_collateral", default=0.0) or 0.0,
+    )
+    backpack = connectors.get("backpack")
+    lighter = connectors.get("lighter")
+    return LiquidationHedgeStrategy(backpack_connector=backpack, lighter_connector=lighter, params=params)
+
+
 def build_hedge_ladder_strategy(cfg: Dict[str, Any], connectors: Dict[str, Any], general: Dict[str, Any]) -> Any:
     from mm_bot.strategy.hedge_ladder import HedgeLadderParams, HedgeLadderStrategy
 
@@ -533,6 +565,11 @@ STRATEGY_BUILDERS: Dict[str, Dict[str, Any]] = {
         "requires": [],
         "resolve_connectors": lambda cfg, general: _resolve_single_connector(cfg, general, default="lighter", choices=["lighter", "grvt"]),
         "description": "Avellaneda-Stoikov model maker",
+    },
+    "liquidation_hedge": {
+        "factory": build_liquidation_hedge_strategy,
+        "requires": ["backpack", "lighter"],
+        "description": "Backpack-Lighter liquidation hedge cycle",
     },
     "hedge_ladder": {
         "factory": build_hedge_ladder_strategy,
