@@ -2,21 +2,27 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
+from mm_bot.execution import TrackingLimitTimeoutError, place_tracking_limit_order
+from mm_bot.execution.orders import OrderState, TrackingLimitOrder, TrackingMarketOrder, OrderUpdate
 from mm_bot.strategy.strategy_base import StrategyBase
-from mm_bot.execution.orders import OrderState, TrackingLimitOrder, TrackingMarketOrder
+
+
+POSITION_TOLERANCE = 1e-8
+MAX_FLATTEN_CYCLES = 3
 
 
 @dataclass
 class ConnectorTestConfig:
     symbol: str
-    side: str = "buy"  # buy then sell, or sell then buy
-    limit_timeout_secs: float = 20.0
+    side: str = "buy"
+    tracking_timeout_secs: float = 120.0
+    tracking_interval_secs: float = 10.0
     settle_timeout_secs: float = 10.0
-    price_offset_ticks: int = 0  # positive widens away from mid when placing limit
-    max_price_retries: int = 1  # extra attempts after the initial try
-    retry_cooldown_secs: float = 0.5
+    market_timeout_secs: float = 30.0
+    price_offset_ticks: int = 0
+    cancel_wait_secs: float = 2.0
 
 
 @dataclass
@@ -26,11 +32,7 @@ class SmokeTestParams:
 
 
 class ConnectorSmokeTestStrategy(StrategyBase):
-    """Lightweight strategy that exercises connectors via one round-trip order.
-
-    For each configured connector the strategy places a small limit order, waits for
-    a terminal state, and optionally flattens the position with a market order.
-    """
+    """Exercise connectors with a tracking-limit round trip plus market exit."""
 
     def __init__(self, connectors: Dict[str, Any], params: SmokeTestParams) -> None:
         self.log = logging.getLogger("mm_bot.strategy.smoke_test")
@@ -40,6 +42,22 @@ class ConnectorSmokeTestStrategy(StrategyBase):
         self._tasks: Dict[str, asyncio.Task] = {}
         self._started = False
         self._coi_seed = int(time.time() * 1000) % 1_000_000 or 1
+        self._results: Dict[str, bool] = {}
+        self._errors: Dict[str, str] = {}
+        self._monitor_task: Optional[asyncio.Task] = None
+        self._active_names: List[str] = []
+        self._finalized = False
+        self._overall_success: Optional[bool] = None
+        self._last_error: Optional[str] = None
+
+    # ------------------------------------------------------------------
+    @property
+    def overall_success(self) -> Optional[bool]:
+        return self._overall_success
+
+    @property
+    def failure_reason(self) -> Optional[str]:
+        return self._last_error
 
     # ------------------------------------------------------------------
     def start(self, core: Any) -> None:
@@ -48,300 +66,452 @@ class ConnectorSmokeTestStrategy(StrategyBase):
             return
         self._started = True
         loop = asyncio.get_event_loop()
+        self._tasks.clear()
+        self._results.clear()
+        self._errors.clear()
+        self._active_names = []
         for name, cfg in self.params.connectors.items():
             connector = self._connectors.get(name)
             if connector is None:
-                self.log.warning("connector '%s' not available; skipping smoke test", name)
+                self.log.error("connector '%s' not available; skipping", name)
+                self._errors[name] = "connector unavailable"
+                self._results[name] = False
                 continue
+            self._active_names.append(name)
             task = loop.create_task(self._run_test(name, connector, cfg), name=f"smoke_test[{name}]")
             self._tasks[name] = task
+        if not self._active_names:
+            loop.create_task(self._finalize(False))
+            return
+        self._monitor_task = loop.create_task(self._monitor_tests(), name="smoke_test.monitor")
 
     def stop(self) -> None:
-        for task in self._tasks.values():
+        for task in list(self._tasks.values()):
             if not task.done():
                 task.cancel()
         self._tasks.clear()
+        if self._monitor_task and not self._monitor_task.done():
+            self._monitor_task.cancel()
+        self._monitor_task = None
         self._started = False
 
     async def on_tick(self, now_ms: float):
-        # strategy work happens in created tasks
         await asyncio.sleep(0)
 
     # ------------------------------------------------------------------
-    async def _run_test(self, name: str, connector: Any, cfg: ConnectorTestConfig) -> None:
+    async def _run_test(self, name: str, connector: Any, cfg: ConnectorTestConfig) -> bool:
         try:
-            await self._exercise_connector(name, connector, cfg)
+            return await self._exercise_connector(name, connector, cfg)
         except asyncio.CancelledError:
             raise
-        except Exception:
-            self.log.exception("smoke test for connector '%s' failed", name)
+        except Exception as exc:
+            self._record_failure(name, f"unexpected error: {exc}")
+            self.log.exception("smoke test for connector '%s' raised", name)
+            return False
 
-    async def _exercise_connector(self, name: str, connector: Any, cfg: ConnectorTestConfig) -> None:
-        symbol = cfg.symbol
+    def _record_success(self, name: str) -> None:
+        self._results[name] = True
+        if name in self._errors:
+            self._errors.pop(name, None)
+        self.log.info("%s smoke test passed", name)
+
+    def _record_failure(self, name: str, reason: str) -> None:
+        existing = self._errors.get(name)
+        if existing and reason not in existing:
+            self._errors[name] = f"{existing}; {reason}"
+        else:
+            self._errors[name] = reason
+        self._results[name] = False
+        self.log.error("%s smoke test failure: %s", name, reason)
+
+    async def _exercise_connector(self, name: str, connector: Any, cfg: ConnectorTestConfig) -> bool:
+        base_amount_i, price_dec, size_dec = await self._resolve_order_size(connector, cfg)
         side = cfg.side.lower()
         is_primary_sell = side in {"sell", "short"}
-        price_dec, size_dec = await connector.get_price_size_decimals(symbol)
-        market = await connector.get_market_info(symbol)
-        min_qty = market.get("min_qty") or market.get("min_order_size") or market.get("minLotSize")
+
         try:
-            min_qty = float(min_qty)
-        except (TypeError, ValueError):
-            min_qty = 0.0
-        size_scale = 10 ** size_dec
-        base_amount_i = max(int(round(min_qty * size_scale)) or 1, 1)
+            limit_tracker = await place_tracking_limit_order(
+                connector,
+                symbol=cfg.symbol,
+                base_amount_i=base_amount_i,
+                is_ask=is_primary_sell,
+                interval_secs=max(cfg.tracking_interval_secs, 1.0),
+                timeout_secs=max(cfg.tracking_timeout_secs, 1.0),
+                price_offset_ticks=cfg.price_offset_ticks,
+                cancel_wait_secs=max(cfg.cancel_wait_secs, 0.5),
+                post_only=False,
+                reduce_only=0,
+                logger=self.log,
+            )
+        except TrackingLimitTimeoutError:
+            self._record_failure(name, "tracking limit timeout reached")
+            return False
+        except Exception as exc:
+            self._record_failure(name, f"tracking limit error: {exc}")
+            return False
 
-        limit_tracker = await self._place_limit_with_retries(
-            name=name,
-            connector=connector,
-            symbol=symbol,
-            base_amount_i=base_amount_i,
-            cfg=cfg,
-            is_primary_sell=is_primary_sell,
-            price_decimals=price_dec,
-        )
+        self._log_order_history(name, "limit", limit_tracker)
+        final_state = limit_tracker.state
+        if final_state not in {OrderState.FILLED, OrderState.PARTIALLY_FILLED}:
+            summary = self._summarize_info(limit_tracker.snapshot().info)
+            detail = f"limit state={final_state.value}"
+            if summary:
+                detail = f"{detail} ({summary})"
+            self._record_failure(name, detail)
+            return False
 
-        if limit_tracker is None:
-            return
-
-        if limit_tracker.state not in {OrderState.FILLED, OrderState.PARTIALLY_FILLED}:
-            info_summary = self._summarize_info(limit_tracker.snapshot().info)
-            if info_summary:
-                self.log.info(
-                    "%s limit order finished with state=%s (%s)",
-                    name,
-                    limit_tracker.state.value,
-                    info_summary,
-                )
-            else:
-                self.log.info(
-                    "%s limit order finished with state=%s",
-                    name,
-                    limit_tracker.state.value,
-                )
-            return
+        filled_i = self._filled_amount_i(limit_tracker, size_dec, fallback=base_amount_i)
+        if filled_i <= 0:
+            self._record_failure(name, "unable to determine filled quantity")
+            return False
 
         await asyncio.sleep(max(cfg.settle_timeout_secs, 0.0))
-        market_tracker: TrackingMarketOrder = await connector.submit_market_order(
-            symbol=symbol,
+
+        market_tracker = await connector.submit_market_order(
+            symbol=cfg.symbol,
             client_order_index=self._next_coi(),
-            base_amount=base_amount_i,
+            base_amount=filled_i,
             is_ask=not is_primary_sell,
+            reduce_only=1,
         )
         try:
-            await market_tracker.wait_final(timeout=cfg.limit_timeout_secs)
+            await market_tracker.wait_final(timeout=max(cfg.market_timeout_secs, 1.0))
         except asyncio.TimeoutError:
-            self.log.warning("%s market close timeout for symbol=%s", name, symbol)
+            self._record_failure(name, "market close timeout")
+            return False
+
+        self._log_order_history(name, "market", market_tracker)
+        market_state = market_tracker.state
+        if market_state not in {OrderState.FILLED, OrderState.CANCELLED}:
+            summary = self._summarize_info(market_tracker.snapshot().info)
+            detail = f"market state={market_state.value}"
+            if summary:
+                detail = f"{detail} ({summary})"
+            self._record_failure(name, detail)
+            return False
+
+        await self._verify_connector_health(name, connector, cfg.symbol)
         await asyncio.sleep(self.params.pause_between_tests_secs)
+        self._record_success(name)
+        return True
+
+    async def _monitor_tests(self) -> None:
+        if not self._tasks:
+            await self._finalize(False)
+            return
+        names = list(self._tasks.keys())
+        results = await asyncio.gather(*self._tasks.values(), return_exceptions=True)
+        for name, result in zip(names, results):
+            if isinstance(result, Exception):
+                self._record_failure(name, f"task crashed: {result}")
+        overall = self._compute_overall_success()
+        await self._finalize(overall)
+
+    def _compute_overall_success(self) -> bool:
+        if not self._active_names:
+            return False
+        return all(self._results.get(name, False) for name in self._active_names)
+
+    async def _finalize(self, success_hint: bool) -> None:
+        if self._finalized:
+            return
+        self._finalized = True
+        cleanup_ok = await self._cleanup_exposures()
+        overall = success_hint and cleanup_ok and not self._errors
+        if not self._active_names:
+            overall = False
+        self._overall_success = overall
+        if not overall:
+            reasons = [f"{name}: {msg}" for name, msg in sorted(self._errors.items())]
+            self._last_error = "; ".join(reasons) if reasons else "smoke test failed"
+            self.log.error("Smoke test failed: %s", self._last_error)
+        else:
+            self._last_error = None
+            self.log.info("All smoke tests completed successfully")
+        if self._core and getattr(self._core, "status", None):
+            status = self._core.status()
+            if status.get("running"):
+                try:
+                    await self._core.stop(cancel_orders=True)
+                except Exception:
+                    self.log.exception("error stopping core from smoke test")
 
     # ------------------------------------------------------------------
-    async def _safe_top_of_book(self, connector: Any, symbol: str, price_dec: int) -> tuple[Optional[int], Optional[int], int]:
-        scale = 10 ** price_dec
-        if hasattr(connector, "get_top_of_book"):
+    async def _resolve_order_size(self, connector: Any, cfg: ConnectorTestConfig) -> Tuple[int, int, int]:
+        price_dec, size_dec = await connector.get_price_size_decimals(cfg.symbol)
+        market = await connector.get_market_info(cfg.symbol)
+        min_qty = market.get("min_qty") or market.get("min_order_size") or market.get("minLotSize")
+        try:
+            min_qty_f = float(min_qty)
+        except (TypeError, ValueError):
+            min_qty_f = 0.0
+        size_scale = 10 ** size_dec
+        base_amount_i = max(int(round(min_qty_f * size_scale)) or 1, 1)
+        return base_amount_i, price_dec, size_dec
+
+    def _filled_amount_i(self, tracker: TrackingLimitOrder, size_dec: int, fallback: int) -> int:
+        scale = 10 ** size_dec
+        update = tracker.snapshot()
+        if update.filled_base is not None:
             try:
-                bid_i, ask_i, scale = await connector.get_top_of_book(symbol)
-                return bid_i, ask_i, scale
+                amount = abs(float(update.filled_base))
+                amount_i = int(round(amount * scale))
+                if amount_i > 0:
+                    return amount_i
             except Exception:
                 pass
-        if hasattr(connector, "get_order_book"):
+        inner = getattr(tracker, "_tracker", None)
+        if inner is not None:
+            for past in reversed(inner.history):
+                filled = getattr(past, "filled_base", None)
+                if filled is not None:
+                    try:
+                        amount = abs(float(filled))
+                        amount_i = int(round(amount * scale))
+                        if amount_i > 0:
+                            return amount_i
+                    except Exception:
+                        continue
+        return fallback
+
+    async def _verify_connector_health(self, name: str, connector: Any, symbol: str) -> None:
+        open_orders: List[Dict[str, Any]] = []
+        rest_fn = getattr(connector, "get_open_orders", None)
+        if callable(rest_fn):
             try:
-                ob = await connector.get_order_book(symbol, depth=5)
-                bids = ob.get("bids") if isinstance(ob, dict) else []
-                asks = ob.get("asks") if isinstance(ob, dict) else []
-                bid_i = int(float(bids[0][0]) * scale) if bids else None
-                ask_i = int(float(asks[0][0]) * scale) if asks else None
-                return bid_i, ask_i, scale
-            except Exception:
-                pass
-        return None, None, scale
+                open_orders = await rest_fn(symbol)
+            except TypeError:
+                open_orders = await rest_fn()
+            except Exception as exc:
+                self.log.warning("%s open_orders check failed: %s", name, exc)
+        if open_orders:
+            self._record_failure(name, f"REST reports {len(open_orders)} open orders")
 
-    def _pick_limit_price(
+        positions = await self._fetch_positions(connector)
+        exposures = [
+            (sym, qty)
+            for sym, qty, _ in positions
+            if sym and qty is not None and abs(float(qty)) > POSITION_TOLERANCE
+        ]
+        if exposures:
+            self._record_failure(name, f"positions still open: {self._format_positions_summary(positions)}")
+
+        tracker_map = getattr(connector, "_order_trackers_by_client", None)
+        if isinstance(tracker_map, dict):
+            inflight = [k for k, v in tracker_map.items() if getattr(v, "state", OrderState.CANCELLED) not in {OrderState.FILLED, OrderState.CANCELLED, OrderState.FAILED}]
+            if inflight:
+                self._record_failure(name, f"tracker reports inflight orders: {inflight}")
+
+    async def _cleanup_exposures(self) -> bool:
+        ok = True
+        for name in self._active_names:
+            connector = self._connectors.get(name)
+            if not connector:
+                continue
+            cfg = self.params.connectors.get(name)
+            positions_before = await self._fetch_positions(connector)
+            summary_before = self._format_positions_summary(positions_before)
+            if summary_before:
+                self.log.info("%s positions before cleanup: %s", name, summary_before)
+            else:
+                self.log.info("%s positions before cleanup: none", name)
+            cancel_ok = await self._cancel_all_orders(name, connector)
+            flatten_ok = await self._flatten_positions(name, connector, cfg)
+            await asyncio.sleep(0.2)
+            positions_after = await self._fetch_positions(connector)
+            summary_after = self._format_positions_summary(positions_after)
+            if summary_after:
+                self.log.info("%s positions after cleanup: %s", name, summary_after)
+            else:
+                self.log.info("%s positions after cleanup: none", name)
+            residual = any(
+                qty is not None and abs(float(qty)) > POSITION_TOLERANCE for _, qty, _ in positions_after
+            )
+            if residual:
+                self._record_failure(name, "residual exposure after cleanup")
+                ok = False
+            if not cancel_ok or not flatten_ok:
+                ok = False
+        return ok
+
+    async def _cancel_all_orders(self, name: str, connector: Any) -> bool:
+        cancel_all = getattr(connector, "cancel_all", None)
+        if not callable(cancel_all):
+            return True
+        try:
+            result = cancel_all()
+            if asyncio.iscoroutine(result):
+                await result
+            self.log.info("%s cancel_all issued", name)
+            return True
+        except Exception as exc:
+            self._record_failure(name, f"cancel_all error: {exc}")
+            return False
+
+    async def _flatten_positions(
         self,
-        bid_i: Optional[int],
-        ask_i: Optional[int],
-        scale: int,
-        offset_ticks: int,
-        primary_sell: bool,
-        *,
-        reference_i: Optional[int] = None,
-        force_cross: bool = False,
-    ) -> int:
-        tick = max(offset_ticks, 1)
-        fallback_price = int(25_000 * scale)
-
-        if primary_sell:
-            if force_cross:
-                if bid_i is not None:
-                    return max(bid_i - tick, 1)
-                if reference_i is not None:
-                    return max(reference_i - tick, 1)
-            base = ask_i if ask_i is not None else reference_i
-            if base is None:
-                base = bid_i
-            if base is None:
-                return fallback_price
-            if reference_i is not None:
-                tolerance = max(int(reference_i * 0.01), tick)
-                if abs(base - reference_i) > tolerance:
-                    base = reference_i
-            price_i = base + offset_ticks
-            if bid_i is not None:
-                price_i = max(price_i, bid_i + 1)
-            return max(price_i, 1)
-        else:
-            if force_cross:
-                if ask_i is not None:
-                    return ask_i + tick
-                if reference_i is not None:
-                    return reference_i + tick
-            base = bid_i if bid_i is not None else reference_i
-            if base is None:
-                base = ask_i
-            if base is None:
-                return fallback_price
-            if reference_i is not None:
-                tolerance = max(int(reference_i * 0.01), tick)
-                if abs(base - reference_i) > tolerance:
-                    base = reference_i
-            price_i = max(base - offset_ticks, 1)
-            if ask_i is not None:
-                price_i = min(price_i, max(ask_i - 1, 1))
-            return price_i
-
-    async def _reference_price_i(
-        self,
+        name: str,
         connector: Any,
-        symbol: str,
-        scale: int,
-        bid_i: Optional[int],
-        ask_i: Optional[int],
-    ) -> Optional[int]:
-        get_last_price = getattr(connector, "get_last_price", None)
-        if callable(get_last_price):
-            try:
-                last_price = await get_last_price(symbol)
-            except Exception:
-                last_price = None
-            if last_price is not None:
-                try:
-                    return int(round(float(last_price) * scale))
-                except (TypeError, ValueError):
-                    pass
-        if bid_i is not None and ask_i is not None:
-            return (bid_i + ask_i) // 2
-        return bid_i or ask_i
+        cfg: Optional[ConnectorTestConfig],
+    ) -> bool:
+        success = True
+        timeout = cfg.market_timeout_secs if cfg else 30.0
+        for cycle in range(MAX_FLATTEN_CYCLES):
+            positions = await self._fetch_positions(connector)
+            actionable = [
+                (symbol, qty)
+                for symbol, qty, _ in positions
+                if symbol and qty is not None and abs(float(qty)) > POSITION_TOLERANCE
+            ]
+            if not actionable:
+                return success
+            self.log.info("%s flatten cycle %s actionable=%s", name, cycle + 1, len(actionable))
+            for symbol, qty in actionable:
+                base_amount_i = await self._position_to_base_units(connector, symbol, qty)
+                if base_amount_i <= 0:
+                    self._record_failure(name, f"unable to determine flatten size for {symbol}")
+                    success = False
+                    continue
+                tracker = await self._execute_market_order(
+                    name=name,
+                    connector=connector,
+                    symbol=symbol,
+                    base_amount_i=base_amount_i,
+                    is_ask=qty > 0,
+                    timeout=timeout,
+                )
+                if tracker is None:
+                    success = False
+            await asyncio.sleep(0.5)
+        positions = await self._fetch_positions(connector)
+        if any(
+            symbol and qty is not None and abs(float(qty)) > POSITION_TOLERANCE for symbol, qty, _ in positions
+        ):
+            success = False
+        return success
 
-    def _next_coi(self) -> int:
-        self._coi_seed = (self._coi_seed + 1) % 1_000_000
-        return self._coi_seed
-
-    async def _place_limit_with_retries(
+    async def _execute_market_order(
         self,
         *,
         name: str,
         connector: Any,
         symbol: str,
         base_amount_i: int,
-        cfg: ConnectorTestConfig,
-        is_primary_sell: bool,
-        price_decimals: int,
-    ) -> Optional[TrackingLimitOrder]:
-        attempts = max(1, int(cfg.max_price_retries) + 1)
-        timeout = cfg.limit_timeout_secs if cfg.limit_timeout_secs and cfg.limit_timeout_secs > 0 else None
-        tracker: Optional[TrackingLimitOrder] = None
-
-        for attempt in range(attempts):
-            force_cross = attempt > 0
-            bid_i, ask_i, scale = await self._safe_top_of_book(connector, symbol, price_decimals)
-            if bid_i is None and ask_i is None:
-                raise RuntimeError(f"{name}: unable to determine top of book for {symbol}")
-            reference_i = await self._reference_price_i(connector, symbol, scale, bid_i, ask_i)
-            price_i = self._pick_limit_price(
-                bid_i,
-                ask_i,
-                scale,
-                cfg.price_offset_ticks,
-                is_primary_sell,
-                reference_i=reference_i,
-                force_cross=force_cross,
-            )
-            client_order_index = self._next_coi()
-            price_f = self._format_price(price_i, scale)
-            bid_f = self._format_price(bid_i, scale) if bid_i is not None else "?"
-            ask_f = self._format_price(ask_i, scale) if ask_i is not None else "?"
-            ref_f = self._format_price(reference_i, scale) if reference_i is not None else "?"
-            self.log.info(
-                "%s placing %s limit test order symbol=%s size_i=%s price_i=%s (%s) bid=%s ask=%s ref=%s attempt=%s/%s",
-                name,
-                "sell" if is_primary_sell else "buy",
-                symbol,
-                base_amount_i,
-                price_i,
-                price_f,
-                bid_f,
-                ask_f,
-                ref_f,
-                attempt + 1,
-                attempts,
-            )
-            tracker = await connector.submit_limit_order(
-                symbol=symbol,
-                client_order_index=client_order_index,
-                base_amount=base_amount_i,
-                price=price_i,
-                is_ask=is_primary_sell,
-                post_only=False,
-            )
-            try:
-                await tracker.wait_final(timeout=timeout)
-            except asyncio.TimeoutError:
-                self.log.warning("%s limit order timeout; cancelling", name)
-                cancel_fn = getattr(connector, "cancel_by_client_id", None)
-                if callable(cancel_fn):
-                    await cancel_fn(symbol, client_order_index)
-                cancel_wait = max(cfg.retry_cooldown_secs, 0.5)
-                try:
-                    await tracker.wait_final(timeout=cancel_wait)
-                except asyncio.TimeoutError:
-                    self.log.warning("%s cancel request did not settle within %.2fs", name, cancel_wait)
-                return tracker
-
-            if tracker.state in {OrderState.FILLED, OrderState.PARTIALLY_FILLED}:
-                return tracker
-
-            info = tracker.snapshot().info
-            if tracker.state == OrderState.FAILED and force_cross is False and attempt + 1 < attempts:
-                if self._should_retry_price(info):
-                    reason = self._summarize_info(info)
-                    if reason:
-                        self.log.warning(
-                            "%s limit order rejected (%s); retrying with aggressive price",
-                            name,
-                            reason,
-                        )
-                    else:
-                        self.log.warning(
-                            "%s limit order rejected; retrying with aggressive price",
-                            name,
-                        )
-                    await asyncio.sleep(max(cfg.retry_cooldown_secs, 0.0))
-                    continue
-            return tracker
-
+        is_ask: bool,
+        timeout: float,
+    ) -> Optional[TrackingMarketOrder]:
+        tracker = await connector.submit_market_order(
+            symbol=symbol,
+            client_order_index=self._next_coi(),
+            base_amount=base_amount_i,
+            is_ask=is_ask,
+            reduce_only=1,
+        )
+        try:
+            await tracker.wait_final(timeout=max(timeout, 1.0))
+        except asyncio.TimeoutError:
+            self._record_failure(name, f"flatten market timeout for {symbol}")
+            return None
+        self._log_order_history(name, "flatten", tracker)
         return tracker
 
-    def _should_retry_price(self, info: Optional[Dict[str, Any]]) -> bool:
-        if not info:
-            return False
-        text = self._collect_info_text(info)
-        if not text:
-            return False
-        lowered = text.lower()
-        triggers = [
-            "price is too far",
-            "price out of range",
-            "price deviation",
-        ]
-        return any(trigger in lowered for trigger in triggers)
+    async def _fetch_positions(
+        self, connector: Any
+    ) -> List[Tuple[Optional[str], Optional[float], Dict[str, Any]]]:
+        get_positions = getattr(connector, "get_positions", None)
+        if not callable(get_positions):
+            return []
+        try:
+            raw = await get_positions()
+        except Exception:
+            return []
+        entries: List[Dict[str, Any]] = []
+        if isinstance(raw, dict):
+            entries = [v for v in raw.values() if isinstance(v, dict)]
+        elif isinstance(raw, list):
+            entries = [v for v in raw if isinstance(v, dict)]
+        out: List[Tuple[Optional[str], Optional[float], Dict[str, Any]]] = []
+        for entry in entries:
+            symbol = entry.get("symbol") or entry.get("instrument")
+            qty = self._extract_position_size(entry)
+            out.append((symbol, qty, entry))
+        return out
+
+    def _extract_position_size(self, entry: Dict[str, Any]) -> Optional[float]:
+        keys = (
+            "position",
+            "netPosition",
+            "netQuantity",
+            "net_quantity",
+            "size",
+            "position_size",
+            "quantity",
+        )
+        for key in keys:
+            if key in entry:
+                try:
+                    return float(entry[key])
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    async def _position_to_base_units(self, connector: Any, symbol: str, qty: float) -> int:
+        getter = getattr(connector, "get_price_size_decimals", None)
+        if not callable(getter):
+            return 0
+        try:
+            _price_dec, size_dec = await getter(symbol)
+            scale = 10 ** size_dec
+            return max(int(round(abs(float(qty)) * scale)), 1)
+        except Exception:
+            return 0
+
+    def _format_positions_summary(
+        self, positions: List[Tuple[Optional[str], Optional[float], Dict[str, Any]]]
+    ) -> str:
+        parts: List[str] = []
+        for symbol, qty, _ in positions:
+            if symbol is None or qty is None:
+                continue
+            try:
+                parts.append(f"{symbol}:{float(qty):.8f}")
+            except Exception:
+                parts.append(f"{symbol}:{qty}")
+        return ", ".join(parts)
+
+    def _log_order_history(
+        self,
+        name: str,
+        order_type: str,
+        tracker: TrackingLimitOrder | TrackingMarketOrder,
+    ) -> None:
+        inner = getattr(tracker, "_tracker", None)
+        history = inner.history if inner is not None else []
+        if not history:
+            self._log_order_update(name, order_type, tracker.snapshot())
+            return
+        for update in history:
+            self._log_order_update(name, order_type, update)
+
+    def _log_order_update(self, name: str, order_type: str, update: OrderUpdate) -> None:
+        info_summary = self._summarize_info(update.info)
+        self.log.info(
+            "%s %s update state=%s filled=%s remaining=%s info=%s",
+            name,
+            order_type,
+            update.state.value,
+            self._format_float(update.filled_base),
+            self._format_float(update.remaining_base),
+            info_summary or "-",
+        )
+
+    def _format_float(self, value: Optional[float]) -> str:
+        if value is None:
+            return "?"
+        try:
+            return f"{float(value):.8f}"
+        except Exception:
+            return str(value)
 
     def _summarize_info(self, info: Optional[Dict[str, Any]]) -> str:
         if not info:
@@ -352,7 +522,7 @@ class ConnectorSmokeTestStrategy(StrategyBase):
         return text[:200]
 
     def _collect_info_text(self, data: Any) -> str:
-        parts: list[str] = []
+        parts: List[str] = []
 
         def _walk(obj: Any):
             if isinstance(obj, dict):
@@ -367,13 +537,9 @@ class ConnectorSmokeTestStrategy(StrategyBase):
         _walk(data)
         return " ".join(parts)
 
-    def _format_price(self, price_i: Optional[int], scale: int) -> str:
-        if price_i is None or scale <= 0:
-            return "?"
-        try:
-            return f"{price_i / scale:.6f}"
-        except Exception:
-            return str(price_i)
+    def _next_coi(self) -> int:
+        self._coi_seed = (self._coi_seed + 1) % 1_000_000
+        return self._coi_seed or 1
 
 
 __all__ = ["ConnectorSmokeTestStrategy", "SmokeTestParams", "ConnectorTestConfig"]

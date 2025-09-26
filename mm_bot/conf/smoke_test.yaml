@@ -1,21 +1,50 @@
-  general:
-    log_config: mm_bot/conf/logging.yaml
-    symbol: BTC_USDC_PERP
+general:
+  log_config: mm_bot/conf/logging.yaml
+  symbol: BTC_USDC_PERP
 
-  connectors:
-    backpack:
-      base_url: https://api.backpack.exchange
-      ws_url: wss://ws.backpack.exchange
-      keys_file: Backpack_key.txt
-      broker_id: "1500"
+connectors:
+  backpack:
+    base_url: https://api.backpack.exchange
+    ws_url: wss://ws.backpack.exchange
+    keys_file: Backpack_key.txt
+    broker_id: "1500"
+  lighter:
+    base_url: https://mainnet.zklighter.elliot.ai
+    keys_file: Lighter_key.txt
+    account_index: null
+    rpm: 4000
+  grvt:
+    base_url: ""
 
-  strategy:
-    name: smoke_test
-    smoke_test:
-      connectors:
-        backpack:
-          symbol: BTC_USDC_PERP
-          side: buy
-          limit_timeout_secs: 0.0    # 若想无限等待
-          settle_timeout_secs: 5.0
-          price_offset_ticks: 1
+strategy:
+  name: smoke_test
+  smoke_test:
+    pause_between_tests_secs: 2.0
+    connectors:
+      backpack:
+        symbol: BTC_USDC_PERP
+        side: buy
+        tracking_timeout_secs: 120.0
+        tracking_interval_secs: 10.0
+        settle_timeout_secs: 5.0
+        market_timeout_secs: 30.0
+        price_offset_ticks: 1
+        cancel_wait_secs: 2.0
+      lighter:
+        symbol: BTC
+        side: buy
+        tracking_timeout_secs: 120.0
+        tracking_interval_secs: 10.0
+        settle_timeout_secs: 5.0
+        market_timeout_secs: 30.0
+        price_offset_ticks: 1
+        cancel_wait_secs: 2.0
+      grvt:
+        symbol: BTC_USDT_Perp
+        side: buy
+        tracking_timeout_secs: 150.0
+        tracking_interval_secs: 12.0
+        settle_timeout_secs: 5.0
+        market_timeout_secs: 45.0
+        price_offset_ticks: 1
+        cancel_wait_secs: 2.0

@@ -5,13 +5,14 @@ XTradingBot is organised as a three-layer stack that keeps strategy logic decoup
 ## 1. Strategy Layer
 - Contains trading logic in `mm_bot/strategy/*`.
 - Strategies inherit from `StrategyBase` and are life-cycle managed by `TradingCore`.
-- Strategies obtain connectors through the runner registry and rely on execution helpers (e.g. tracking orders) exposed by the connector layer.
-- The redesigned smoke-test strategy (`ConnectorSmokeTestStrategy`) now anchors its limit prices to both the live order book and the connector-provided ticker, retries once with an aggressive price if an exchange rejects the initial quote, and logs bid/ask/last-price context for easier diagnosis.
+- Strategies obtain connectors through the runner registry and rely on execution helpers (e.g. tracking orders) exposed by the execution layer.
+- The smoke-test strategy (`ConnectorSmokeTestStrategy`) now drives a **tracking limit** diagnostic: it re-posts a limit order at top-of-book until filled, verifies order-state updates from both REST and websocket feeds, flattens the fill with a reduce-only market order, and confirms no residual exposure remains.
 
 ## 2. Execution Layer
 - Located in `mm_bot/execution/`.
 - `OrderTracker` maintains the order state machine (`NEW → SUBMITTING → OPEN → PARTIALLY_FILLED → FILLED/CANCELLED/FAILED`).
-- `TrackingLimitOrder`/`TrackingMarketOrder` expose awaitable helpers for strategies so they can `await order.wait_final(...)` or tail incremental updates.
+- `TrackingLimitOrder`/`TrackingMarketOrder` expose awaitable helpers so strategies can `await order.wait_final(...)` or stream incremental updates.
+- `tracking_limit.py` adds `place_tracking_limit_order()`, a reusable helper that keeps replacing a limit order at the best bid/ask until it fills or times out, abstracting the loop that the smoke test (and future strategies) can reuse.
 - Connectors inherit from `BaseConnector` to integrate tracking, fan out events, and provide consistent debug logging. The base automatically dispatches callbacks and logs every transition when debug mode is enabled.
 
 ## 3. Connector Layer
@@ -26,20 +27,21 @@ XTradingBot is organised as a three-layer stack that keeps strategy logic decoup
 ## Runner & Registry
 - The unified `mm_bot/bin/runner.py` replaces the legacy `run_*.py` entrypoints.
 - `mm_bot/runtime/builders.py` + `registry.py` resolve connectors and strategies declared in configuration files. Strategies can opt into dynamic connector resolution (e.g. `smoke_test` enumerates connectors listed under its configuration block).
-- The builder now preserves explicit timeout/ retry settings from the config, wires smoke-test specific defaults (ticker-aware pricing, websocket bootstrap), and invokes optional `prepare_*` hooks so connectors can start their websocket feeds before strategy work begins.
+- `build_smoke_test_strategy()` now understands per-connector tracking intervals, timeouts, and cancel-wait settings so diagnostics can be tuned per venue.
+- The runner waits for `TradingCore` to stop (signalled by the strategy) and exits with a non-zero code when the smoke test reports a failure.
 - Legacy entrypoints are archived under `mm_bot/bin/legacy/` for reference.
 
 ## Connector Enhancements
-- All connectors inherit common shutdown semantics via `TradingCore`, which now awaits async `stop`/`close` hooks to prevent lingering network sessions.
-- `BackpackConnector` exposes `get_last_price`, de-duplicates order execution responses, and ensures websocket state is stopped before closing the underlying `aiohttp` session.
+- Connectors expose uniform metadata helpers (`get_market_info`, `get_price_size_decimals`, `get_top_of_book`) so the tracking helper can compute tick/size integers without duplicating logic.
+- `BackpackConnector`, `LighterConnector`, and `GrvtConnector` surface both REST-derived and websocket-cached views of orders/positions, enabling the smoke test to cross-check state across transports.
 - Websocket bootstrap happens inside `prepare_smoke_test` so the first market snapshot reflects live data before we submit the diagnostic orders.
 
 ## Current Focus
-- Smoke test infrastructure validates Backpack connectivity end-to-end with order retries and rich logging.
-- Iterative improvements are being staged to support additional connectors (e.g. Lighter) without duplicating logic.
+- Smoke-test infrastructure validates Backpack, Lighter, and GRVT connectivity end-to-end using the shared tracking-limit helper and per-connector configs.
+- Execution helpers are being consolidated so production strategies can reuse the same primitives the diagnostics employ.
 
 ## Next Steps
-1. Extend the smoke-test strategy and builders to cover the Lighter connector with the same retry/ticker safeguards.
+1. Extend tracking diagnostics to cover reduce-only/partial-fill scenarios and surface richer telemetry.
 2. Draft connector development documentation that explains required hooks, shared helpers, and testing expectations.
 3. Begin onboarding the Aster exchange connector, reusing the shared `BaseConnector` instrumentation.
 

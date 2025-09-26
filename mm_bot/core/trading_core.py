@@ -42,6 +42,8 @@ class TradingCore:
 
         self._is_running: bool = False
         self._started_at_ms: Optional[float] = None
+        self._stopped_event = asyncio.Event()
+        self._stopped_event.set()
 
     def dbg(self, msg: str, exc_info: bool = False):
         if self.debug_enabled:
@@ -139,6 +141,7 @@ class TradingCore:
         self.clock.start()
         self._is_running = True
         self._started_at_ms = time.time() * 1000
+        self._stopped_event.clear()
         self.logger.info("TradingCore started")
         self.dbg(f"Clock started with tick_size={self.tick_size}")
         return True
@@ -146,6 +149,7 @@ class TradingCore:
     async def stop(self, cancel_orders: bool = True) -> bool:
         if not self._is_running:
             self.logger.warning("TradingCore is not running")
+            self._stopped_event.set()
             return False
 
         # Stop clock first to avoid further ticks
@@ -218,6 +222,7 @@ class TradingCore:
 
         self._is_running = False
         self.logger.info("TradingCore stopped")
+        self._stopped_event.set()
         return True
 
     async def shutdown(self, cancel_orders: bool = True) -> bool:
@@ -228,6 +233,9 @@ class TradingCore:
         self._started_at_ms = None
         self.dbg("Shutdown complete; state cleared")
         return ok
+
+    async def wait_until_stopped(self) -> None:
+        await self._stopped_event.wait()
 
     # Introspection --------------------------------------------------------
     def status(self) -> Dict[str, Any]:

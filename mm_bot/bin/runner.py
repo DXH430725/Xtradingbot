@@ -7,7 +7,7 @@ import asyncio
 import logging
 import os
 import sys
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if ROOT not in sys.path:
@@ -182,15 +182,20 @@ async def main(argv: List[str] | None = None) -> None:
 
     await core.start()
     log.info("Strategy '%s' started", strategy_name)
+    error_reason: Optional[str] = None
     try:
-        while True:
-            await asyncio.sleep(3600)
+        await core.wait_until_stopped()
+        overall = getattr(strategy, "overall_success", None)
+        if overall is False:
+            error_reason = getattr(strategy, "failure_reason", "strategy reported failure")
     except KeyboardInterrupt:
         log.info("Interrupt received; shutting down")
     finally:
         await core.stop(cancel_orders=True)
         await core.shutdown(cancel_orders=True)
         log.info("Shutdown complete")
+    if error_reason:
+        raise SystemExit(error_reason)
 
 
 if __name__ == "__main__":

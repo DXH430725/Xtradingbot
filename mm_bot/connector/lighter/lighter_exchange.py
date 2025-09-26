@@ -61,6 +61,7 @@ class LighterConnector(BaseConnector):
 
         self._symbol_to_market: Dict[str, int] = {}
         self._market_to_symbol: Dict[int, str] = {}
+        self._market_info_by_symbol: Dict[str, Dict[str, Any]] = {}
 
         # simple event hooks (strategy can subscribe)
         self._on_order_book_update: Optional[Callable[[str, Dict[str, Any]], None]] = None
@@ -153,14 +154,41 @@ class LighterConnector(BaseConnector):
             account_index=account_index,
         )
 
-    async def _ensure_markets(self):
-        if self._symbol_to_market:
+    def _store_market_entry(self, entry: Any) -> None:
+        try:
+            symbol = entry.symbol
+            market_id = int(entry.market_id)
+        except Exception:
             return
+        self._symbol_to_market[symbol] = market_id
+        self._market_to_symbol[market_id] = symbol
+        price_dec = self._safe_int(getattr(entry, "supported_price_decimals", 0))
+        size_dec = self._safe_int(getattr(entry, "supported_size_decimals", 0))
+        min_base = self._safe_float(getattr(entry, "min_base_amount", 0.0))
+        tick_val = getattr(entry, "price_tick", None)
+        tick_size = self._safe_float(tick_val) if tick_val is not None else (1.0 / (10 ** price_dec) if price_dec else 0.0)
+        step_val = getattr(entry, "quantity_step", None)
+        step_size = self._safe_float(step_val) if step_val is not None else (1.0 / (10 ** size_dec) if size_dec else 0.0)
+        self._market_info_by_symbol[symbol] = {
+            "symbol": symbol,
+            "market_index": market_id,
+            "price_precision": price_dec,
+            "quantity_precision": size_dec,
+            "min_qty": min_base,
+            "tick_size": tick_size,
+            "step_size": step_size,
+        }
+
+    async def _refresh_market_entries(self) -> None:
         await self._throttler.acquire("/api/v1/orderBooks")
         ob = await self.order_api.order_books()
-        for entry in ob.order_books:
-            self._symbol_to_market[entry.symbol] = int(entry.market_id)
-            self._market_to_symbol[int(entry.market_id)] = entry.symbol
+        entries = getattr(ob, "order_books", []) or []
+        for entry in entries:
+            self._store_market_entry(entry)
+
+    async def _ensure_markets(self):
+        if not self._symbol_to_market:
+            await self._refresh_market_entries()
 
     async def list_symbols(self) -> List[str]:
         await self._ensure_markets()
@@ -168,30 +196,19 @@ class LighterConnector(BaseConnector):
 
     async def get_price_size_decimals(self, symbol: str) -> Tuple[int, int]:
         """Return (price_decimals, size_decimals) for a given symbol."""
-        await self._ensure_markets()
-        mid = await self.get_market_id(symbol)
-        await self._throttler.acquire("/api/v1/orderBooks")
-        ob_list = await self.order_api.order_books()
-        entry = next((e for e in ob_list.order_books if int(e.market_id) == mid), None)
-        if not entry:
-            raise RuntimeError("market scales not found")
-        return int(entry.supported_price_decimals), int(entry.supported_size_decimals)
+        entry = await self._get_market_entry(symbol)
+        return int(entry["price_precision"]), int(entry["quantity_precision"])
 
     async def get_min_order_size_i(self, symbol: str) -> int:
         """Return minimal base size in integer units for a symbol."""
-        await self._ensure_markets()
-        mid = await self.get_market_id(symbol)
-        await self._throttler.acquire("/api/v1/orderBooks")
-        ob_list = await self.order_api.order_books()
-        entry = next((e for e in ob_list.order_books if int(e.market_id) == mid), None)
-        if not entry:
-            raise RuntimeError("Market entry not found")
-        size_dec = int(entry.supported_size_decimals)
-        try:
-            min_size = float(entry.min_base_amount)
-        except Exception:
-            min_size = float(str(entry.min_base_amount)) if entry.min_base_amount is not None else 0.0
+        entry = await self._get_market_entry(symbol)
+        size_dec = int(entry["quantity_precision"])
+        min_size = self._safe_float(entry.get("min_qty", 0.0))
         return max(1, int(round(min_size * (10 ** size_dec))))
+
+    async def get_market_info(self, symbol: str) -> Dict[str, Any]:
+        entry = await self._get_market_entry(symbol)
+        return dict(entry)
 
     # public / rest --------------------------------------------------------------
     async def get_market_id(self, symbol: str) -> int:
@@ -214,6 +231,34 @@ class LighterConnector(BaseConnector):
         # account(by, value): by="index" and value is string index
         detail = await self.account_api.account(by="index", value=str(idx))
         return detail.to_dict()
+
+    async def _get_market_entry(self, symbol: str) -> Dict[str, Any]:
+        await self._ensure_markets()
+        info = self._market_info_by_symbol.get(symbol)
+        if info is None:
+            await self._refresh_market_entries()
+            info = self._market_info_by_symbol.get(symbol)
+        if info is None:
+            raise ValueError(f"Market info unavailable for {symbol}")
+        return info
+
+    def _safe_int(self, value: Any) -> int:
+        try:
+            return int(value)
+        except Exception:
+            try:
+                return int(float(value))
+            except Exception:
+                return 0
+
+    def _safe_float(self, value: Any) -> float:
+        try:
+            return float(value)
+        except Exception:
+            try:
+                return float(str(value))
+            except Exception:
+                return 0.0
 
     # websocket -----------------------------------------------------------------
     def _mk_ws(self, market_ids: Optional[List[int]] = None, accounts: Optional[List[int]] = None, host: Optional[str] = None):

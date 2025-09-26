@@ -422,29 +422,33 @@ def build_smoke_test_strategy(cfg: Dict[str, Any], connectors: Dict[str, Any], g
     for name, data in connector_cfg.items():
         if not isinstance(data, dict):
             continue
-        limit_timeout = get_float(data, "limit_timeout_secs", default=20.0)
-        if limit_timeout is None:
-            limit_timeout = 20.0
+        tracking_timeout = get_float(data, "tracking_timeout_secs", default=120.0)
+        if tracking_timeout is None or tracking_timeout <= 0:
+            tracking_timeout = 120.0
+        tracking_interval = get_float(data, "tracking_interval_secs", default=10.0)
+        if tracking_interval is None or tracking_interval <= 0:
+            tracking_interval = 10.0
         settle_timeout = get_float(data, "settle_timeout_secs", default=10.0)
         if settle_timeout is None:
             settle_timeout = 10.0
+        market_timeout = get_float(data, "market_timeout_secs", default=30.0)
+        if market_timeout is None or market_timeout <= 0:
+            market_timeout = 30.0
         price_offset = get_int(data, "price_offset_ticks", default=0)
         if price_offset is None:
             price_offset = 0
-        max_price_retries = get_int(data, "max_price_retries", default=1)
-        if max_price_retries is None:
-            max_price_retries = 1
-        retry_cooldown = get_float(data, "retry_cooldown_secs", default=0.5)
-        if retry_cooldown is None:
-            retry_cooldown = 0.5
+        cancel_wait = get_float(data, "cancel_wait_secs", default=2.0)
+        if cancel_wait is None or cancel_wait <= 0:
+            cancel_wait = 2.0
         mapped[name] = ConnectorTestConfig(
             symbol=str(data.get("symbol", default_symbol)),
             side=str(data.get("side", "buy")),
-            limit_timeout_secs=limit_timeout,
+            tracking_timeout_secs=tracking_timeout,
+            tracking_interval_secs=tracking_interval,
             settle_timeout_secs=settle_timeout,
+            market_timeout_secs=market_timeout,
             price_offset_ticks=price_offset,
-            max_price_retries=max_price_retries,
-            retry_cooldown_secs=retry_cooldown,
+            cancel_wait_secs=cancel_wait,
         )
     pause_between = get_float(cfg, "pause_between_tests_secs", default=2.0)
     if pause_between is None:

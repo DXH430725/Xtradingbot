@@ -78,6 +78,7 @@ class GrvtConnector(BaseConnector):
         self._price_decimals_by_symbol: Dict[str, int] = {}
         self._size_decimals_by_symbol: Dict[str, int] = {}
         self._min_size_i_by_symbol: Dict[str, int] = {}
+        self._market_info_by_symbol: Dict[str, Dict[str, Any]] = {}
 
     # lifecycle
     def start(self, core=None):
@@ -234,13 +235,28 @@ class GrvtConnector(BaseConnector):
                         m[oi] = od
                         by_sym[sym] = m
                         # coi mapping (if present)
+                        coi = 0
                         try:
                             coi_s = str(((od.get("metadata") or {}).get("client_order_id") or od.get("client_order_id") or "0"))
                             coi = int(coi_s) if coi_s.isdigit() else 0
                             if coi:
                                 self._coi_to_order_id[coi] = order_id
                         except Exception:
-                            pass
+                            coi = 0
+                        try:
+                            leg = od.get("legs", [{}])[0] if isinstance(od.get("legs"), list) else od
+                            is_buy = bool(leg.get("is_buying_asset") or leg.get("is_buy") or leg.get("side") == "buy")
+                        except Exception:
+                            is_buy = True
+                        status = str((od.get("status") or ((od.get("state") or {}).get("status")) or "")).lower()
+                        self._update_order_state(
+                            client_order_id=coi if coi else None,
+                            exchange_order_id=order_id,
+                            symbol=sym,
+                            is_ask=not is_buy,
+                            status=status,
+                            info=od if isinstance(od, dict) else {},
+                        )
                     except Exception:
                         continue
                 # replace map
@@ -285,6 +301,15 @@ class GrvtConnector(BaseConnector):
     async def get_min_order_size_i(self, symbol: str) -> int:
         await self._ensure_markets()
         return self._min_size_i_by_symbol[symbol]
+
+    async def get_market_info(self, symbol: str) -> Dict[str, Any]:
+        await self._ensure_markets()
+        if symbol not in self._market_info_by_symbol:
+            await self._refresh_markets()
+        info = self._market_info_by_symbol.get(symbol)
+        if info is None:
+            raise ValueError(f"Market info unavailable for {symbol}")
+        return dict(info)
 
     # order book
     async def get_top_of_book(self, symbol: str) -> Tuple[Optional[int], Optional[int], int]:
@@ -444,6 +469,81 @@ class GrvtConnector(BaseConnector):
         except Exception as e:
             return (None, None, str(e))
 
+    async def submit_limit_order(
+        self,
+        symbol: str,
+        client_order_index: int,
+        base_amount: int,
+        price: int,
+        is_ask: bool,
+        *,
+        post_only: bool = False,
+        reduce_only: int = 0,
+    ) -> TrackingLimitOrder:
+        tracker = self.create_tracking_limit_order(
+            client_order_index,
+            symbol=symbol,
+            is_ask=is_ask,
+            price_i=price,
+            size_i=base_amount,
+        )
+        self._update_order_state(
+            client_order_id=client_order_index,
+            symbol=symbol,
+            is_ask=is_ask,
+            state=OrderState.SUBMITTING,
+            info={"request": {
+                "symbol": symbol,
+                "base_amount": base_amount,
+                "price": price,
+                "is_ask": is_ask,
+                "post_only": post_only,
+                "reduce_only": reduce_only,
+            }},
+        )
+        _created, ret, err = await self.place_limit(
+            symbol=symbol,
+            client_order_index=client_order_index,
+            base_amount=base_amount,
+            price=price,
+            is_ask=is_ask,
+            post_only=post_only,
+            reduce_only=reduce_only,
+        )
+        if err:
+            self._update_order_state(
+                client_order_id=client_order_index,
+                symbol=symbol,
+                is_ask=is_ask,
+                state=OrderState.FAILED,
+                info={"error": err},
+            )
+            return tracker
+        info_dict = ret if isinstance(ret, dict) else {}
+        order_id = self._coi_to_order_id.get(client_order_index)
+        if not order_id and info_dict:
+            possible = str(info_dict.get("order_id") or info_dict.get("id") or "")
+            if possible:
+                order_id = possible
+                if possible not in self._order_id_to_int:
+                    try:
+                        self._order_id_to_int[possible] = int(possible, 16) if possible.startswith("0x") else int(possible)
+                    except Exception:
+                        self._order_id_to_int[possible] = abs(hash(possible)) & 0x7FFFFFFF
+                self._coi_to_order_id[int(client_order_index)] = possible
+        status = ""
+        if info_dict:
+            status = info_dict.get("status") or ((info_dict.get("state") or {}).get("status"))
+        self._update_order_state(
+            client_order_id=client_order_index,
+            exchange_order_id=order_id,
+            symbol=symbol,
+            is_ask=is_ask,
+            status=status,
+            info=info_dict,
+        )
+        return tracker
+
     async def place_market(
         self,
         symbol: str,
@@ -479,6 +579,56 @@ class GrvtConnector(BaseConnector):
             return (None, ret, None)
         except Exception as e:
             return (None, None, str(e))
+
+    async def submit_market_order(
+        self,
+        symbol: str,
+        client_order_index: int,
+        base_amount: int,
+        is_ask: bool,
+        *,
+        reduce_only: int = 0,
+    ) -> TrackingMarketOrder:
+        tracker = self.create_tracking_market_order(client_order_index, symbol=symbol, is_ask=is_ask)
+        self._update_order_state(
+            client_order_id=client_order_index,
+            symbol=symbol,
+            is_ask=is_ask,
+            state=OrderState.SUBMITTING,
+            info={"request": {
+                "symbol": symbol,
+                "base_amount": base_amount,
+                "is_ask": is_ask,
+                "reduce_only": reduce_only,
+            }},
+        )
+        _created, ret, err = await self.place_market(
+            symbol=symbol,
+            client_order_index=client_order_index,
+            base_amount=base_amount,
+            is_ask=is_ask,
+            reduce_only=reduce_only,
+        )
+        if err:
+            self._update_order_state(
+                client_order_id=client_order_index,
+                symbol=symbol,
+                is_ask=is_ask,
+                state=OrderState.FAILED,
+                info={"error": err},
+            )
+            return tracker
+        info_dict = ret if isinstance(ret, dict) else {}
+        order_id = self._coi_to_order_id.get(client_order_index)
+        self._update_order_state(
+            client_order_id=client_order_index,
+            exchange_order_id=order_id,
+            symbol=symbol,
+            is_ask=is_ask,
+            state=OrderState.FILLED,
+            info=info_dict,
+        )
+        return tracker
 
     async def cancel_order(self, order_index: int, market_index: Optional[int] = None) -> Any:
         assert self._rest is not None
@@ -540,33 +690,68 @@ class GrvtConnector(BaseConnector):
         return trading_account_id, api_key, priv
 
     async def _ensure_markets(self) -> None:
-        if self._symbol_to_market:
+        if self._symbol_to_market and self._market_info_by_symbol:
             return
+        await self._refresh_markets()
+
+    async def _refresh_markets(self) -> None:
         assert self._rest is not None
         markets = await self._rest.load_markets()
         if not markets:
             markets = {}
-        # create synthetic integer market ids
-        idx = 1
+        next_index = max(self._market_to_symbol.keys(), default=0) + 1
         for sym, info in markets.items():
-            self._symbol_to_market[sym] = idx
-            self._market_to_symbol[idx] = sym
-            # decimals
+            market_index = self._symbol_to_market.get(sym)
+            if market_index is None:
+                market_index = next_index
+                next_index += 1
+            self._symbol_to_market[sym] = market_index
+            self._market_to_symbol[market_index] = sym
             size_dec = int(info.get("base_decimals", 0) or 0)
-            tick_size = str(info.get("tick_size", "0.01") or "0.01")
-            if "." in tick_size:
-                price_dec = len(tick_size.split(".", 1)[1].rstrip("0"))
+            tick_size_raw = info.get("tick_size") or info.get("price_tick") or "0.01"
+            tick_size = self._safe_float(tick_size_raw) or 0.0
+            if tick_size > 0:
+                price_dec = max(len(f"{tick_size:.12f}".rstrip("0").split(".")[1]) if "." in f"{tick_size:.12f}" else 0, 0)
             else:
-                price_dec = 0
+                price_dec = int(info.get("price_decimals", 0) or 0)
+            if price_dec == 0:
+                # fallback to string analysis like before
+                tick_str = str(tick_size_raw or "0.01")
+                if "." in tick_str:
+                    price_dec = len(tick_str.split(".", 1)[1].rstrip("0"))
             min_size_str = str(info.get("min_size", "0") or "0")
             try:
                 min_size_i = int(Decimal(min_size_str) * (10 ** size_dec))
             except Exception:
                 min_size_i = 1
+            min_size_i = max(1, min_size_i)
             self._price_decimals_by_symbol[sym] = price_dec
             self._size_decimals_by_symbol[sym] = size_dec
-            self._min_size_i_by_symbol[sym] = max(1, min_size_i)
-            idx += 1
+            self._min_size_i_by_symbol[sym] = min_size_i
+            min_qty = min_size_i / (10 ** size_dec) if size_dec else float(min_size_i)
+            step_size_raw = info.get("step_size") or info.get("base_step")
+            if step_size_raw is not None:
+                step_size = self._safe_float(step_size_raw)
+            else:
+                step_size = 1.0 / (10 ** size_dec) if size_dec else 0.0
+            self._market_info_by_symbol[sym] = {
+                "symbol": sym,
+                "market_index": market_index,
+                "price_precision": price_dec,
+                "quantity_precision": size_dec,
+                "tick_size": tick_size,
+                "step_size": step_size,
+                "min_qty": min_qty,
+            }
+
+    def _safe_float(self, value: Any) -> float:
+        try:
+            return float(value)
+        except Exception:
+            try:
+                return float(str(value))
+            except Exception:
+                return 0.0
 
     # --------------------- WS callbacks ---------------------
     async def _on_ws_position(self, message: Dict[str, Any]) -> None:
@@ -609,6 +794,27 @@ class GrvtConnector(BaseConnector):
             status = str(((od.get("state") or {}).get("status")) or od.get("status") or "").upper()
             m[oi] = od
             self._active_orders_by_symbol[sym] = m
+            try:
+                meta = od.get("metadata") or {}
+                coi_val = meta.get("client_order_id") or od.get("client_order_id")
+                coi = int(str(coi_val)) if coi_val is not None and str(coi_val).isdigit() else 0
+            except Exception:
+                coi = 0
+            if coi:
+                self._coi_to_order_id[coi] = oid
+            try:
+                leg = od.get("legs", [{}])[0] if isinstance(od.get("legs"), list) else od
+                is_buy = bool(leg.get("is_buying_asset") or leg.get("is_buy") or leg.get("side") == "buy")
+            except Exception:
+                is_buy = True
+            self._update_order_state(
+                client_order_id=coi if coi else None,
+                exchange_order_id=oid,
+                symbol=sym,
+                is_ask=not is_buy,
+                status=status,
+                info=od,
+            )
             if status == "CANCELLED" and self._on_order_cancelled:
                 try:
                     self._on_order_cancelled(od)
@@ -628,6 +834,36 @@ class GrvtConnector(BaseConnector):
             t = payload.get("fill") or payload
             if not isinstance(t, dict):
                 return
+            try:
+                sym = t.get("instrument") or t.get("symbol")
+            except Exception:
+                sym = None
+            try:
+                coi_val = t.get("client_order_id") or (t.get("metadata") or {}).get("client_order_id")
+                coi = int(str(coi_val)) if coi_val is not None and str(coi_val).isdigit() else 0
+            except Exception:
+                coi = 0
+            order_id = str(t.get("order_id") or t.get("id") or "")
+            if coi and order_id:
+                self._coi_to_order_id[coi] = order_id
+                if order_id not in self._order_id_to_int:
+                    try:
+                        self._order_id_to_int[order_id] = int(order_id, 16) if order_id.startswith("0x") else int(order_id)
+                    except Exception:
+                        self._order_id_to_int[order_id] = abs(hash(order_id)) & 0x7FFFFFFF
+            try:
+                side = str(t.get("side") or t.get("direction") or "buy").lower()
+                is_buy = side in {"buy", "bid", "long"}
+            except Exception:
+                is_buy = True
+            self._update_order_state(
+                client_order_id=coi if coi else None,
+                exchange_order_id=order_id or None,
+                symbol=sym,
+                is_ask=not is_buy,
+                state=OrderState.FILLED,
+                info=t,
+            )
             if self._on_trade:
                 try:
                     self._on_trade(t)
