@@ -62,6 +62,14 @@ CONNECTOR_BUILDERS: Dict[str, Dict[str, Any]] = {
         "factory": build_lighter_connector,
         "description": "Lighter exchange connector",
     },
+    "lighter1": {
+        "factory": build_lighter_connector,
+        "description": "Lighter exchange connector #1",
+    },
+    "lighter2": {
+        "factory": build_lighter_connector,
+        "description": "Lighter exchange connector #2",
+    },
     "grvt": {
         "factory": build_grvt_connector,
         "description": "GRVT exchange connector",
@@ -351,32 +359,132 @@ def build_liquidation_hedge_strategy(cfg: Dict[str, Any], connectors: Dict[str, 
     from mm_bot.strategy.liquidation_hedge import LiquidationHedgeParams, LiquidationHedgeStrategy
 
     params_cfg = get_dict(cfg, "liquidation_hedge") or cfg
-    leverage = get_float(params_cfg, "leverage", default=50.0) or 50.0
-    price_offset = int(get_float(params_cfg, "price_offset_ticks", default=1) or 1)
-    timeout_secs = get_float(params_cfg, "timeout_secs", default=24 * 3600.0) or (24 * 3600.0)
-    poll_secs = get_float(params_cfg, "poll_interval_secs", default=5.0) or 5.0
-    reduce_buffer = int(get_float(params_cfg, "reduce_only_buffer_ticks", default=5) or 5)
-    reverse_on_timeout = get_bool(params_cfg, "reverse_on_timeout", default=True)
-    max_cycles = int(get_float(params_cfg, "max_cycles", default=1) or 1)
-    tracking_post_only = get_bool(params_cfg, "tracking_post_only", default=True)
+    base_params = LiquidationHedgeParams()
+
+    def pick_float(key: str, default: float) -> float:
+        val = get_float(params_cfg, key, default=None)
+        return float(default if val is None else val)
+
+    def pick_int(key: str, default: int) -> int:
+        val = get_float(params_cfg, key, default=None)
+        return int(default if val is None else val)
+
+    leverage = pick_float("leverage", base_params.leverage)
+    price_offset = pick_int("price_offset_ticks", base_params.price_offset_ticks)
+    timeout_secs = pick_float("timeout_secs", base_params.timeout_secs)
+    poll_secs = pick_float("poll_interval_secs", base_params.poll_interval_secs)
+    reduce_buffer = pick_int("reduce_only_buffer_ticks", base_params.reduce_only_buffer_ticks)
+    reverse_on_timeout = get_bool(params_cfg, "reverse_on_timeout", default=base_params.reverse_on_timeout)
+    max_cycles = pick_int("max_cycles", base_params.max_cycles)
+    tracking_post_only = get_bool(params_cfg, "tracking_post_only", default=base_params.tracking_post_only)
+    backpack_attempts = pick_int("backpack_entry_max_attempts", base_params.backpack_entry_max_attempts)
+    backpack_retry_delay = pick_float("backpack_retry_delay_secs", base_params.backpack_retry_delay_secs)
+    lighter_max_slippage = pick_float("lighter_max_slippage", base_params.lighter_max_slippage)
+    lighter_attempts = pick_int("lighter_hedge_max_attempts", base_params.lighter_hedge_max_attempts)
+    lighter_retry_delay = pick_float("lighter_retry_delay_secs", base_params.lighter_retry_delay_secs)
+    wait_min = pick_float("wait_min_secs", base_params.wait_min_secs)
+    wait_max = pick_float("wait_max_secs", base_params.wait_max_secs)
+    confirm_timeout = pick_float("confirmation_timeout_secs", base_params.confirmation_timeout_secs)
+    confirm_poll = pick_float("confirmation_poll_secs", base_params.confirmation_poll_secs)
+    rebalance_attempts = pick_int("rebalance_max_attempts", base_params.rebalance_max_attempts)
+    rebalance_delay = pick_float("rebalance_retry_delay_secs", base_params.rebalance_retry_delay_secs)
+    telemetry_enabled_cfg = get_bool(params_cfg, "telemetry_enabled", default=base_params.telemetry_enabled)
+    telemetry_config_path = get_str(
+        params_cfg,
+        "telemetry_config_path",
+        default=base_params.telemetry_config_path,
+    ) or base_params.telemetry_config_path
+    telemetry_interval = pick_float("telemetry_interval_secs", base_params.telemetry_interval_secs)
+    telegram_enabled_cfg = get_bool(params_cfg, "telegram_enabled", default=base_params.telegram_enabled)
+    telegram_keys_path = get_str(params_cfg, "telegram_keys_path", default=base_params.telegram_keys_path) or base_params.telegram_keys_path
+
     params = LiquidationHedgeParams(
-        backpack_symbol=get_str(params_cfg, "backpack_symbol", default="ETH_USDC_PERP") or "ETH_USDC_PERP",
-        lighter_symbol=get_str(params_cfg, "lighter_symbol", default="ETH") or "ETH",
+        backpack_symbol=get_str(params_cfg, "backpack_symbol", default=base_params.backpack_symbol) or base_params.backpack_symbol,
+        lighter_symbol=get_str(params_cfg, "lighter_symbol", default=base_params.lighter_symbol) or base_params.lighter_symbol,
         leverage=leverage,
-        direction=get_str(params_cfg, "direction", default="long_backpack") or "long_backpack",
+        direction=get_str(params_cfg, "direction", default=base_params.direction) or base_params.direction,
         price_offset_ticks=price_offset,
-        tracking_cancel_wait_secs=get_float(params_cfg, "tracking_cancel_wait_secs", default=2.0) or 2.0,
+        tracking_cancel_wait_secs=pick_float("tracking_cancel_wait_secs", base_params.tracking_cancel_wait_secs),
         tracking_post_only=tracking_post_only,
         timeout_secs=timeout_secs,
         poll_interval_secs=poll_secs,
         reduce_only_buffer_ticks=reduce_buffer,
         reverse_on_timeout=reverse_on_timeout,
         max_cycles=max_cycles,
-        min_collateral=get_float(params_cfg, "min_collateral", default=0.0) or 0.0,
+        min_collateral=pick_float("min_collateral", base_params.min_collateral),
+        backpack_entry_max_attempts=backpack_attempts,
+        backpack_retry_delay_secs=backpack_retry_delay,
+        lighter_max_slippage=lighter_max_slippage,
+        lighter_hedge_max_attempts=lighter_attempts,
+        lighter_retry_delay_secs=lighter_retry_delay,
+        wait_min_secs=wait_min,
+        wait_max_secs=wait_max,
+        confirmation_timeout_secs=confirm_timeout,
+        confirmation_poll_secs=confirm_poll,
+        rebalance_max_attempts=rebalance_attempts,
+        rebalance_retry_delay_secs=rebalance_delay,
+        telemetry_enabled=telemetry_enabled_cfg if telemetry_enabled_cfg is not None else base_params.telemetry_enabled,
+        telemetry_config_path=telemetry_config_path,
+        telemetry_interval_secs=telemetry_interval,
+        telegram_enabled=telegram_enabled_cfg if telegram_enabled_cfg is not None else base_params.telegram_enabled,
+        telegram_keys_path=telegram_keys_path,
     )
     backpack = connectors.get("backpack")
-    lighter = connectors.get("lighter")
-    return LiquidationHedgeStrategy(backpack_connector=backpack, lighter_connector=lighter, params=params)
+    lighter1 = connectors.get("lighter1") or connectors.get("lighter")
+    lighter2 = connectors.get("lighter2")
+    if lighter1 is None or lighter2 is None:
+        raise RuntimeError("Liquidation hedge requires lighter1 and lighter2 connectors")
+    return LiquidationHedgeStrategy(backpack_connector=backpack, lighter1_connector=lighter1, lighter2_connector=lighter2, params=params)
+
+
+def build_lighter_min_order_strategy(cfg: Dict[str, Any], connectors: Dict[str, Any], general: Dict[str, Any]) -> Any:
+    from mm_bot.strategy.lighter_min_order import (
+        LighterMinOrderParams,
+        LighterMinOrderStrategy,
+        LighterMinOrderTarget,
+    )
+
+    params_cfg = get_dict(cfg, "lighter_min_order") or cfg
+
+    targets_cfg_raw = params_cfg.get("targets")
+    targets: Optional[List[LighterMinOrderTarget]] = None
+    if isinstance(targets_cfg_raw, list):
+        targets = []
+        for item in targets_cfg_raw:
+            if not isinstance(item, dict):
+                continue
+            connector_name = get_str(item, "connector", default="")
+            if not connector_name:
+                continue
+            targets.append(
+                LighterMinOrderTarget(
+                    connector=connector_name.lower(),
+                    direction=get_str(item, "direction", default="buy") or "buy",
+                    reduce_only=get_bool(item, "reduce_only", default=True),
+                    size_multiplier=get_float(item, "size_multiplier", default=1.0) or 1.0,
+                )
+            )
+
+    params = LighterMinOrderParams(
+        symbol=get_str(params_cfg, "symbol", default="ETH") or "ETH",
+        direction=get_str(params_cfg, "direction", default="buy") or "buy",
+        reduce_only=get_bool(params_cfg, "reduce_only", default=True),
+        size_multiplier=get_float(params_cfg, "size_multiplier", default=1.0) or 1.0,
+        max_attempts=int(get_float(params_cfg, "max_attempts", default=3) or 3),
+        retry_delay_secs=get_float(params_cfg, "retry_delay_secs", default=0.5) or 0.5,
+        max_slippage=get_float(params_cfg, "max_slippage", default=0.001) or 0.001,
+        targets=targets,
+    )
+
+    usable_connectors = {
+        name.lower(): conn
+        for name, conn in connectors.items()
+        if name.lower().startswith("lighter")
+    }
+    if not usable_connectors:
+        raise RuntimeError("lighter_min_order requires at least one lighter connector")
+
+    return LighterMinOrderStrategy(connectors=usable_connectors, params=params)
 
 
 def build_hedge_ladder_strategy(cfg: Dict[str, Any], connectors: Dict[str, Any], general: Dict[str, Any]) -> Any:
@@ -537,6 +645,22 @@ def _resolve_smoke_connectors(strategy_cfg: Dict[str, Any], general: Dict[str, A
     return [str(k).lower() for k in connectors_cfg.keys()]
 
 
+def _resolve_lighter_min_order_connectors(strategy_cfg: Dict[str, Any], general: Dict[str, Any]) -> List[str]:
+    params = get_dict(strategy_cfg, "lighter_min_order") or strategy_cfg
+    targets_cfg = params.get("targets")
+    connectors: List[str] = []
+    if isinstance(targets_cfg, list):
+        for item in targets_cfg:
+            if not isinstance(item, dict):
+                continue
+            name = get_str(item, "connector", default="")
+            if name:
+                connectors.append(name.lower())
+    if connectors:
+        return connectors
+    return ["lighter"]
+
+
 STRATEGY_BUILDERS: Dict[str, Dict[str, Any]] = {
     "trend_ladder": {
         "factory": build_trend_ladder_strategy,
@@ -568,8 +692,14 @@ STRATEGY_BUILDERS: Dict[str, Dict[str, Any]] = {
     },
     "liquidation_hedge": {
         "factory": build_liquidation_hedge_strategy,
-        "requires": ["backpack", "lighter"],
+        "requires": ["backpack", "lighter1", "lighter2"],
         "description": "Backpack-Lighter liquidation hedge cycle",
+    },
+    "lighter_min_order": {
+        "factory": build_lighter_min_order_strategy,
+        "requires": [],
+        "resolve_connectors": _resolve_lighter_min_order_connectors,
+        "description": "Submit a single minimal market order on Lighter",
     },
     "hedge_ladder": {
         "factory": build_hedge_ladder_strategy,

@@ -147,12 +147,25 @@ class LighterConnector(BaseConnector):
         if self.signer is not None:
             return
         account_index = await self._ensure_account_index()
+        nonce_type = getattr(lighter.nonce_manager, "NonceManagerType", None)
+        nonce_mode = None
+        if nonce_type is not None:
+            try:
+                nonce_mode = nonce_type.API
+            except Exception:
+                nonce_mode = None
         self.signer = lighter.SignerClient(
             url=self.config.base_url,
             private_key=self._api_priv,
             api_key_index=int(self._api_key_index or 0),
             account_index=account_index,
+            nonce_management_type=nonce_mode or lighter.nonce_manager.NonceManagerType.OPTIMISTIC,
         )
+        try:
+            key_idx = int(getattr(self.signer, "api_key_index", 0))
+            self.signer.nonce_manager.hard_refresh_nonce(key_idx)
+        except Exception:
+            pass
 
     def _store_market_entry(self, entry: Any) -> None:
         try:
@@ -823,7 +836,9 @@ class LighterConnector(BaseConnector):
         base_amount: int,
         is_ask: bool,
         reduce_only: int = 0,
-        ) -> Tuple[Any, Any, Optional[str]]:
+        *,
+        max_slippage: Optional[float] = None,
+    ) -> Tuple[Any, Any, Optional[str]]:
         await self._ensure_signer()
         market_index = await self.get_market_id(symbol)
         # Fetch top-of-book to provide avg execution price required by signer
@@ -844,26 +859,51 @@ class LighterConnector(BaseConnector):
 
         await self._throttler.acquire("/api/v1/sendTx")
         self.create_tracking_market_order(client_order_index, symbol=symbol, is_ask=is_ask)
+        slippage = max_slippage if (max_slippage is not None and max_slippage > 0) else None
+        acceptable_price = avg_execution_price
+        if slippage is not None:
+            try:
+                acceptable_price = int(round(avg_execution_price * (1 + slippage * (-1 if is_ask else 1))))
+            except Exception:
+                acceptable_price = avg_execution_price
+
+        info_payload = {
+            "market_index": market_index,
+            "base_amount": base_amount,
+            "avg_execution_price": avg_execution_price,
+            "reduce_only": reduce_only,
+        }
+        if slippage is not None:
+            info_payload["max_slippage"] = slippage
+            info_payload["acceptable_execution_price"] = acceptable_price
+
         self._update_order_state(
             client_order_id=client_order_index,
             symbol=symbol,
             is_ask=is_ask,
             state=OrderState.SUBMITTING,
-            info={
-                "market_index": market_index,
-                "base_amount": base_amount,
-                "avg_execution_price": avg_execution_price,
-                "reduce_only": reduce_only,
-            },
+            info=info_payload,
         )
-        created_tx, ret, err = await self.signer.create_market_order(
-            market_index=market_index,
-            client_order_index=client_order_index,
-            base_amount=base_amount,
-            avg_execution_price=avg_execution_price,
-            is_ask=bool(is_ask),
-            reduce_only=bool(reduce_only),
-        )
+
+        if slippage is not None:
+            created_tx, ret, err = await self.signer.create_market_order_if_slippage(
+                market_index=market_index,
+                client_order_index=client_order_index,
+                base_amount=base_amount,
+                max_slippage=slippage,
+                is_ask=bool(is_ask),
+                reduce_only=bool(reduce_only),
+                ideal_price=avg_execution_price,
+            )
+        else:
+            created_tx, ret, err = await self.signer.create_market_order(
+                market_index=market_index,
+                client_order_index=client_order_index,
+                base_amount=base_amount,
+                avg_execution_price=avg_execution_price,
+                is_ask=bool(is_ask),
+                reduce_only=bool(reduce_only),
+            )
         # normalize non-OK responses into errors
         try:
             code = getattr(ret, "code", None)
@@ -913,6 +953,7 @@ class LighterConnector(BaseConnector):
         is_ask: bool,
         *,
         reduce_only: int = 0,
+        max_slippage: Optional[float] = None,
     ) -> TrackingMarketOrder:
         tracker = self.create_tracking_market_order(client_order_index, symbol=symbol, is_ask=is_ask)
         await self.place_market(
@@ -921,6 +962,7 @@ class LighterConnector(BaseConnector):
             base_amount=base_amount,
             is_ask=is_ask,
             reduce_only=reduce_only,
+            max_slippage=max_slippage,
         )
         return tracker
 

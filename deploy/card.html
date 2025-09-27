@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>Bot Telemetry Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root{
+      --bg:#0b1220; --card:#121a2b; --muted:#8ea0c2; --ok:#19c37d; --warn:#ffb020; --mid:#ff884d; --bad:#ff5c5c; --text:#e9eefb; --acc:#5aa8ff; --bar:#1b2740;
+    }
+    body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Helvetica Neue',Arial;color:var(--text);background:linear-gradient(180deg,#0a0f1c,#0b1220);}
+    header{padding:20px 24px;border-bottom:1px solid rgba(255,255,255,.06);display:flex;justify-content:space-between;align-items:center;gap:12px}
+    h1{margin:0;font-size:18px;letter-spacing:.3px}
+    main{max-width:1200px;margin:24px auto;padding:0 16px}
+    footer{color:var(--muted);font-size:12px;text-align:center;margin:14px 0}
+
+    .btn{cursor:pointer;padding:6px 12px;border-radius:10px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.06);color:var(--text);font-size:12px;transition:background .15s,border .15s}
+    .btn:hover{background:rgba(255,255,255,.12)}
+    .btn.warn{border-color:rgba(255,92,92,.35);color:#ffd2d2;background:rgba(255,92,92,.10)}
+    .btn.warn:hover{background:rgba(255,92,92,.18)}
+    .btn.ghost{background:transparent}
+
+    .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px}
+    .card{background:var(--card);border:1px solid rgba(255,255,255,.08);border-radius:14px;box-shadow:0 4px 14px rgba(0,0,0,.35);overflow:hidden}
+    .card-hd{display:flex;justify-content:space-between;align-items:center;padding:14px;border-bottom:1px solid rgba(255,255,255,.06)}
+    .name{font-weight:600}
+    .status{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted)}
+    .dot{display:inline-flex;width:10px;height:10px;border-radius:50%}
+    .ok{background:var(--ok)} .bad{background:var(--bad)}
+    .card-bd{padding:14px}
+    .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:6px 0}
+    .kv{flex:1 1 120px;color:var(--muted);font-size:12px}
+    .kv b{color:var(--text);font-size:14px}
+    .mono{font-variant-numeric:tabular-nums;font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;}
+    .bar{position:relative;height:12px;background:var(--bar);border-radius:999px;overflow:hidden}
+    .bar > span{position:absolute;left:0;top:0;bottom:0;width:0;border-radius:999px}
+    .tag{display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid rgba(255,255,255,.12);font-size:12px;color:#cfe0ff;background:rgba(255,255,255,.04)}
+    .label{font-size:12px;color:var(--muted)}
+    .updated{font-size:12px;color:var(--muted);padding:0 14px 12px;text-align:right}
+
+    .section-title{margin:18px 0 10px 4px;color:var(--muted);font-size:12px;letter-spacing:.2px;text-transform:uppercase}
+    .group-card{background:var(--card);border:1px solid rgba(255,255,255,.08);border-radius:14px;box-shadow:0 8px 18px rgba(0,0,0,.4);overflow:hidden}
+    .group-hd{display:flex;justify-content:space-between;align-items:center;padding:14px;border-bottom:1px solid rgba(255,255,255,.06)}
+    .group-name{font-weight:600;font-size:14px}
+    .group-status{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6px}
+    .role-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;padding:12px}
+    .role-card{border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:10px;background:rgba(255,255,255,.03)}
+    .role-chip{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:2px 8px;border-radius:999px;border:1px solid rgba(255,255,255,.12);color:#cfe0ff}
+    .role-dot{width:8px;height:8px;border-radius:50%;display:inline-block}
+    .role-BP{background:linear-gradient(90deg,#3753ff33,#3753ff11)}
+    .role-L1{background:linear-gradient(90deg,#19c37d33,#19c37d11)}
+    .role-L2{background:linear-gradient(90deg,#ff884d33,#ff884d11)}
+
+    footer{color:var(--muted);font-size:12px;text-align:center;margin:14px 0}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Bot Telemetry Dashboard</h1>
+    <div style="display:flex;gap:8px;align-items:center">
+      <button class="btn" id="btn-refresh">刷新</button>
+      <button class="btn warn" id="btn-prune">清理离线</button>
+      <button class="btn ghost" id="btn-token">设置Token</button>
+    </div>
+  </header>
+  <main>
+    <div class="updated">最后更新：<span id="last-updated">—</span></div>
+    <div id="grid" class="grid"></div>
+  </main>
+  <footer>自托管 · 心跳上报 · Token 可选</footer>
+
+  <script>
+    const grid = document.getElementById('grid');
+    const updated = document.getElementById('last-updated');
+    const TOKEN_KEY = 'telemetry-token';
+
+    document.getElementById('btn-refresh').addEventListener('click', () => refresh(true));
+    document.getElementById('btn-prune').addEventListener('click', pruneInactive);
+    document.getElementById('btn-token').addEventListener('click', promptToken);
+
+    function fmtAgo(ms){
+      const s = Math.floor(ms/1000);
+      if(s < 60) return `${s}s`;
+      const m = Math.floor(s/60);
+      if(m < 60) return `${m}m`;
+      const h = Math.floor(m/60);
+      if(h < 48) return `${h}h`;
+      const d = Math.floor(h/24);
+      return `${d}d`;
+    }
+    function clamp(n,min,max){return Math.max(min,Math.min(max,n));}
+    function utilInfo(pos,maxPos){
+      const num = x => (x===null||x===undefined||x!==x) ? null : Number(x);
+      const p = num(pos); const m = num(maxPos);
+      if(m===null || m<=0 || p===null){
+        return { pct:null, text:'未知', color:'var(--muted)' };
+      }
+      const pct = clamp((p/m)*100,0,100);
+      if(pct < 30) return { pct, text:'良好', color:'var(--ok)' };
+      if(pct < 60) return { pct, text:'积压', color:'var(--warn)' };
+      if(pct < 90) return { pct, text:'严重挤压', color:'var(--mid)' };
+      return { pct, text:'极端库存', color:'var(--bad)' };
+    }
+    function numFmt(v){
+      if(v===null||v===undefined||v!==v) return '—';
+      const n = Number(v);
+      if(!isFinite(n)) return String(v);
+      if(Math.abs(n) >= 1_000_000) return n.toLocaleString(undefined,{notation:'compact',maximumFractionDigits:2});
+      return n.toLocaleString(undefined,{maximumFractionDigits:6});
+    }
+
+    function getAuthHeaders(){
+      const headers = { 'Content-Type': 'application/json' };
+      const token = sessionStorage.getItem(TOKEN_KEY);
+      if(token) headers['x-auth-token'] = token;
+      return headers;
+    }
+    function promptToken(){
+      const current = sessionStorage.getItem(TOKEN_KEY) || '';
+      const value = window.prompt('输入管理 Token (留空为清除)', current);
+      if(value === null) return;
+      if(value.trim()){
+        sessionStorage.setItem(TOKEN_KEY, value.trim());
+      }else{
+        sessionStorage.removeItem(TOKEN_KEY);
+      }
+    }
+    async function pruneInactive(){
+      try{
+        const res = await fetch('/admin/prune', { method:'POST', headers:getAuthHeaders() });
+        if(!res.ok){
+          const body = await res.text();
+          alert(`清理失败: ${res.status} ${body}`);
+          return;
+        }
+        const data = await res.json();
+        alert(`已删除 ${data.removed} 台机器人，剩余 ${data.total}`);
+        await refresh(true);
+      }catch(e){
+        alert(`请求失败: ${e}`);
+      }
+    }
+
+    function card(bot){
+      const p = bot.payload || {};
+      const dotCls = bot.online ? 'ok' : 'bad';
+      const statusTxt = bot.online ? '在线' : '离线';
+      const u = utilInfo(p.position_base, p.max_position_base);
+      const pctText = u.pct===null ? '—' : `${u.pct.toFixed(0)}%`;
+      const upn = numFmt(p.pnl_unrealized);
+      const bal = numFmt(p.balance_total);
+      const lat = p.latency_ms==null? '—' : `${Math.round(p.latency_ms)}ms`;
+      const ago = fmtAgo(bot.last_update_ms_ago || 0);
+      return `
+      <div class="card">
+        <div class="card-hd">
+          <div class="name">${bot.name}</div>
+          <div class="status"><span class="dot ${dotCls}"></span>${statusTxt} · ${ago}前</div>
+        </div>
+        <div class="card-bd">
+          <div class="row">
+            <span class="tag">${p.symbol ?? '—'}</span>
+            <span class="tag">方向：${p.direction ?? '—'}</span>
+            <span class="tag">延时：${lat}</span>
+          </div>
+          <div class="row">
+            <div class="kv">仓位：<b class="mono">${numFmt(p.position_base)}</b></div>
+            <div class="kv">最大仓位：<b class="mono">${numFmt(p.max_position_base)}</b></div>
+          </div>
+          <div class="row">
+            <div style="flex:1">
+              <div class="label">仓位占用（${u.text} · ${pctText}）</div>
+              <div class="bar"><span style="width:${u.pct??0}%;background:${u.color}"></span></div>
+            </div>
+          </div>
+          <div class="row">
+            <div class="kv">未实现PnL：<b class="mono">${upn}</b></div>
+            <div class="kv">余额/权益：<b class="mono">${bal}</b></div>
+          </div>
+        </div>
+      </div>`;
+    }
+
+    function roleCard(bot, role){
+      const payload = bot.payload || {};
+      const online = !!bot.online;
+      const dot = online ? 'ok' : 'bad';
+      const u = utilInfo(payload.position_base, payload.max_position_base);
+      const pctText = u.pct===null ? '—' : `${u.pct.toFixed(0)}%`;
+      const bal = numFmt(payload.balance_total);
+      const ago = fmtAgo(bot.last_update_ms_ago || 0);
+      const lat = payload.latency_ms==null? '—' : `${Math.round(payload.latency_ms)}ms`;
+      return `
+        <div class="role-card role-${role}">
+          <div class="row" style="justify-content:space-between;align-items:center">
+            <span class="role-chip"><span class="role-dot" style="background:var(--${dot})"></span>${role}</span>
+            <span class="label">${ago}前更新</span>
+          </div>
+          <div class="row">
+            <span class="tag">${payload.symbol ?? '—'}</span>
+            <span class="tag">方向：${payload.direction ?? '—'}</span>
+            <span class="tag">延时：${lat}</span>
+          </div>
+          <div class="row">
+            <div class="kv">仓位：<b class="mono">${numFmt(payload.position_base)}</b></div>
+            <div class="kv">余额：<b class="mono">${bal}</b></div>
+          </div>
+          <div class="row">
+            <div style="flex:1">
+              <div class="label">仓位占用（${u.text} · ${pctText}）</div>
+              <div class="bar"><span style="width:${u.pct??0}%;background:${u.color}"></span></div>
+            </div>
+          </div>
+        </div>`;
+    }
+
+    function groupCard(group){
+      const allOnline = group.items.length && group.items.every(x => x.online);
+      const anyOffline = group.items.some(x => !x.online);
+      const statusText = allOnline ? '全部在线' : (anyOffline ? '部分离线' : '—');
+      const statusDot = allOnline ? 'ok' : 'bad';
+      const role = r => group.byRole[r] || { payload:{}, online:false, last_update_ms_ago:0 };
+      return `
+        <div class="group-card">
+          <div class="group-hd">
+            <div class="group-name">对冲组：${group.id}</div>
+            <div class="group-status"><span class="dot ${statusDot}"></span>${statusText}</div>
+          </div>
+          <div class="role-grid">
+            ${roleCard(role('BP'), 'BP')}
+            ${roleCard(role('L1'), 'L1')}
+            ${roleCard(role('L2'), 'L2')}
+          </div>
+        </div>`;
+    }
+
+    function groupBots(list){
+      const groups = new Map();
+      const singles = [];
+      for(const bot of list){
+        const payload = bot.payload || {};
+        const groupId = payload.group || payload.group_id;
+        const role = (payload.role || '').toUpperCase();
+        if(groupId && ['BP','L1','L2'].includes(role)){
+          if(!groups.has(groupId)){
+            groups.set(groupId, { id: groupId, items: [], byRole:{} });
+          }
+          const group = groups.get(groupId);
+          group.items.push(bot);
+          group.byRole[role] = bot;
+        }else{
+          singles.push(bot);
+        }
+      }
+      return { groups: Array.from(groups.values()), singles };
+    }
+
+    async function refresh(manual=false){
+      try{
+        const res = await fetch('/api/status', { cache:'no-store' });
+        const data = await res.json();
+        updated.textContent = new Date(data.now).toLocaleString();
+        const list = data.bots || [];
+        if(!list.length){
+          grid.innerHTML = `<div class="card"><div class="card-bd">暂无上报数据</div></div>`;
+          return;
+        }
+        const { groups, singles } = groupBots(list);
+        let html = '';
+        if(groups.length){
+          html += `<div class="section-title">对冲分组</div>`;
+          html += groups.map(groupCard).join('');
+        }
+        if(singles.length){
+          html += `<div class="section-title">未分组</div>`;
+          html += singles.map(card).join('');
+        }
+        grid.innerHTML = html || `<div class="card"><div class="card-bd">暂无可展示</div></div>`;
+      }catch(e){
+        grid.innerHTML = `<div class="card"><div class="card-bd">拉取失败：${e}</div></div>`;
+      }
+    }
+
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>

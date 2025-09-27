@@ -1,24 +1,8 @@
-> Summary
+# Progress Summary (2025-09-27)
+- Refactored liquidation hedge into tri-venue workflow (Backpack + lighter1 + lighter2), added telemetry heartbeats and Telegram notifications, COI/nonce handling, and market-based BP rebalance.
+- Built dual-target lighter_min_order diagnostic strategy plus config to probe nonce/volume issues across both Lighter API keys.
+- Improved telemetry dashboard: new prune endpoint, grouped BP/L1/L2 cards, and auth-aware controls; added shared telemetry config JSON for strategies.
+- Verified Lighter position signs and adjusted connector reads (`sign * position`), ensuring hedger detects short exposure correctly.
+- Updated configs/builders to surface new telemetry settings and dual-connector requirements.
 
-  - Rebuilt ConnectorSmokeTestStrategy to drive tracking-limit diagnostics via the new execution helper, auto-flatten
-  fills, cross-check REST/WS state, and stop the core once all connectors finish.
-  - Added mm_bot/execution/tracking_limit.py with place_tracking_limit_order()/TrackingLimitTimeoutError, updated the
-  execution package exports, and refreshed builder/config plumbing (per-connector YAML files) for tracking intervals/
-  timeouts.
-  - Extended connectors (Backpack already supported; Lighter/GRVT now expose cached market metadata) and tightened the
-  runner/core to exit automatically when the smoke test completes.
-  - Updated architecture documentation (ARCHITECTURE.md, new DETAIL_ARCHITECTURE.md) plus agent.md with the new workflow
-  and daily closeout checklist; committed and pushed 316d6d7 to origin/main.
-
-  Validation
-
-  - python -m compileall mm_bot/strategy/smoke_test.py mm_bot/runtime/builders.py mm_bot/conf
-  - python -m compileall mm_bot/bin/runner.py mm_bot/core/trading_core.py mm_bot/connector/lighter/lighter_exchange.py
-  mm_bot/connector/grvt/grvt_exchange.py mm_bot/execution/tracking_limit.py
-
-  Next Steps
-
-  - Run the updated smoke tests (mm_bot/conf/smoke_test*.yaml) to confirm live behaviour and adjust connector-specific
-  tracking parameters as needed.
-
-  python mm_bot/bin/runner.py --config mm_bot/conf/smoke_test_backpack.yaml
+Next: run hedge against live venues (with distinct API key indices) to confirm L2 entry + BP rebalance flow, monitor dashboard, and iterate on size/permission issues if Lighter still trims fills.

@@ -26,6 +26,7 @@ async def place_tracking_limit_order(
     post_only: bool = False,
     reduce_only: int = 0,
     logger: Optional[Any] = None,
+    max_attempts: Optional[int] = None,
 ) -> TrackingLimitOrder:
     """Continuously re-post a limit order at the top of book until filled.
 
@@ -67,6 +68,8 @@ async def place_tracking_limit_order(
     start_ts = time.monotonic()
     attempts = 0
     tracker: Optional[TrackingLimitOrder] = None
+
+    max_attempts = max_attempts if (max_attempts is None or max_attempts > 0) else 1
 
     while True:
         attempts += 1
@@ -120,6 +123,8 @@ async def place_tracking_limit_order(
             return tracker
 
         if tracker.state == OrderState.CANCELLED:
+            if max_attempts is not None and attempts >= max_attempts:
+                return tracker
             continue
 
         await _cancel_order(
@@ -128,6 +133,9 @@ async def place_tracking_limit_order(
             client_order_index=client_order_index,
             wait_secs=cancel_wait_secs,
         )
+
+        if max_attempts is not None and attempts >= max_attempts:
+            return tracker
 
     # Should never reach, added for mypy completeness.
     return tracker  # type: ignore[return-value]
