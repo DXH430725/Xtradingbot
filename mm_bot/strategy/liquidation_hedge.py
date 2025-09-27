@@ -10,12 +10,12 @@ from typing import Any, Dict, Optional, Tuple
 
 import aiohttp
 
-from mm_bot.execution import TrackingLimitTimeoutError, place_tracking_limit_order
-from mm_bot.execution.orders import OrderState, TrackingLimitOrder
+from mm_bot.execution.orders import OrderState, TrackingMarketOrder
 from mm_bot.strategy.strategy_base import StrategyBase
 
 POSITION_EPS = 1e-9
-COI_LIMIT = 281_474_976_710_655  # 2**48 - 1
+COI_LIMIT_LIGHTER = 281_474_976_710_655  # 2**48 - 1
+COI_LIMIT_BACKPACK = 4_294_967_295       # 2**32 - 1
 DEFAULT_TELEMETRY_CONFIG = "mm_bot/conf/telemetry.json"
 
 
@@ -141,12 +141,7 @@ class LiquidationHedgeStrategy(StrategyBase):
         self._rng = random.Random()
 
         # order sequencing
-        seed = int(time.time() * 1000) % COI_LIMIT or 1
-        self._coi_seq: Dict[str, int] = {
-            "backpack": seed,
-            "lighter1": (seed + 1000) % COI_LIMIT or 1,
-            "lighter2": (seed + 2000) % COI_LIMIT or 1,
-        }
+        self._coi_seq: Dict[str, int] = {}
         self._order_locks: Dict[str, asyncio.Lock] = {
             "backpack": asyncio.Lock(),
             "lighter1": asyncio.Lock(),
@@ -287,10 +282,15 @@ class LiquidationHedgeStrategy(StrategyBase):
         size_base = ctx.l1_plan.base_amount if ctx.l1_plan else 0.0
         ctx.bp_entry_size_i = max(self._bp_min_size_i, int(round(size_base * self._bp_size_scale)))
 
-        entry = await self._place_backpack_entry(ctx.bp_entry_size_i)
-        if entry is None:
+        tracker = await self._submit_backpack_market(
+            size_i=ctx.bp_entry_size_i,
+            is_ask=not self._direction_long,
+            reduce_only=0,
+            label="bp_entry",
+        )
+        if tracker is None:
             return False
-        ctx.bp_filled_i = self._resolve_filled(entry, self._bp_size_scale, ctx.bp_entry_size_i)
+        ctx.bp_filled_i = self._resolve_market_filled(tracker, self._bp_size_scale, ctx.bp_entry_size_i)
         if ctx.bp_filled_i <= 0:
             self.log.error("unable to resolve filled amount; aborting")
             return False
@@ -439,71 +439,6 @@ class LiquidationHedgeStrategy(StrategyBase):
             return None
         return VenueOrderPlan(base_amount=base_amount, size_i=size_i, collateral=collateral)
 
-    async def _place_backpack_entry(self, size_i: int) -> Optional[TrackingLimitOrder]:
-        attempts = max(int(self.params.backpack_entry_max_attempts or 0), 0) or None
-        retry_delay = max(float(self.params.backpack_retry_delay_secs or 0.0), 0.0)
-        post_only = bool(self.params.tracking_post_only)
-        last_details: Optional[Dict[str, Any]] = None
-        attempt = 0
-        while True:
-            attempt += 1
-            try:
-                order = await place_tracking_limit_order(
-                    self.backpack,
-                    symbol=self.params.backpack_symbol,
-                    base_amount_i=size_i,
-                    is_ask=not self._direction_long,
-                    price_offset_ticks=self.params.price_offset_ticks,
-                    cancel_wait_secs=self.params.tracking_cancel_wait_secs,
-                    post_only=post_only,
-                    reduce_only=0,
-                    logger=self.log,
-                )
-            except TrackingLimitTimeoutError as exc:
-                self.log.error("backpack tracking order timeout on attempt=%s: %s", attempt, exc)
-                order = None
-                last_details = {"error": str(exc)}
-            except Exception as exc:
-                self.log.error("backpack tracking order failed on attempt=%s: %s", attempt, exc)
-                order = None
-                last_details = {"error": str(exc)}
-
-            if order is None:
-                if attempts is not None and attempt >= attempts:
-                    break
-                if retry_delay:
-                    await asyncio.sleep(retry_delay)
-                continue
-
-            if order.state == OrderState.FILLED:
-                return order
-
-            snapshot = order.snapshot()
-            details = snapshot.info or {}
-            last_details = details or {"state": order.state.value}
-            reason_text = str(details.get("message") or details.get("error") or details.get("code") or "").lower()
-            if "immediately match" in reason_text and post_only:
-                post_only = False
-                self.log.info("disabling post-only after immediate-match rejection")
-                if retry_delay:
-                    await asyncio.sleep(retry_delay)
-                continue
-
-            self.log.warning(
-                "backpack tracking order attempt=%s state=%s details=%s",
-                attempt,
-                order.state.value,
-                details,
-            )
-
-            if attempts is not None and attempt >= attempts:
-                break
-            if retry_delay:
-                await asyncio.sleep(retry_delay)
-
-        self.log.error("backpack tracking order exhausted attempts=%s last_details=%s", attempts or "unbounded", last_details)
-        return None
-
     async def _submit_lighter_market(
         self,
         *,
@@ -585,6 +520,72 @@ class LiquidationHedgeStrategy(StrategyBase):
             if attempt < max_attempts and retry_delay:
                 await asyncio.sleep(retry_delay)
         return False
+
+    async def _submit_backpack_market(
+        self,
+        *,
+        size_i: int,
+        is_ask: bool,
+        reduce_only: int,
+        label: str,
+        attempts: Optional[int] = None,
+        retry_delay: Optional[float] = None,
+        log_errors: bool = True,
+    ) -> Optional[TrackingMarketOrder]:
+        if size_i <= 0:
+            return None
+        max_attempts = max(int(attempts or self.params.backpack_entry_max_attempts or 1), 1)
+        delay = retry_delay if retry_delay is not None else max(float(self.params.backpack_retry_delay_secs or 0.0), 0.0)
+        lock = self._order_locks.setdefault("backpack", asyncio.Lock())
+        for attempt in range(1, max_attempts + 1):
+            try:
+                async with lock:
+                    coi = self._next_coi("backpack")
+                    self.log.info(
+                        "%s attempt=%s submit coi=%s size_i=%s is_ask=%s reduce_only=%s",
+                        label,
+                        attempt,
+                        coi,
+                        size_i,
+                        is_ask,
+                        reduce_only,
+                    )
+                    tracker: TrackingMarketOrder = await self.backpack.submit_market_order(
+                        symbol=self.params.backpack_symbol,
+                        client_order_index=coi,
+                        base_amount=size_i,
+                        is_ask=is_ask,
+                        reduce_only=reduce_only,
+                    )
+                await tracker.wait_final(timeout=30.0)
+            except Exception as exc:
+                if log_errors:
+                    self.log.error("%s market order attempt=%s failed: %s", label, attempt, exc)
+                tracker = None
+
+            if tracker and tracker.state == OrderState.FILLED:
+                self.log.info("%s attempt=%s filled", label, attempt)
+                return tracker
+
+            state = tracker.state.value if tracker else "error"
+            info = tracker.snapshot().info if tracker else None
+            reason = None
+            if tracker is not None:
+                reason = getattr(tracker, "last_error", None) or getattr(tracker, "reject_reason", None)
+            if reason is None and isinstance(info, dict):
+                reason = info.get("error") or info.get("message") or info.get("reason")
+            if log_errors:
+                self.log.warning(
+                    "%s attempt=%s ended state=%s reason=%s info=%s",
+                    label,
+                    attempt,
+                    state,
+                    reason,
+                    self._shorten_info(info),
+                )
+            if attempt < max_attempts and delay:
+                await asyncio.sleep(delay)
+        return None
 
     async def _confirm_position(
         self,
@@ -702,26 +703,21 @@ class LiquidationHedgeStrategy(StrategyBase):
     async def _flatten_backpack(self, size_i: int, emergency: bool = False) -> None:
         if size_i <= 0:
             return
-        try:
-            tracker = await place_tracking_limit_order(
-                self.backpack,
-                symbol=self.params.backpack_symbol,
-                base_amount_i=size_i,
-                is_ask=self._direction_long,
-                price_offset_ticks=self.params.price_offset_ticks,
-                cancel_wait_secs=self.params.tracking_cancel_wait_secs,
-                post_only=False,
-                reduce_only=1,
-                logger=self.log if emergency else None,
-            )
-            if tracker.state != OrderState.FILLED:
-                await tracker.wait_final(timeout=30.0)
-        except Exception as exc:
-            self.log.error("flatten backpack failed: %s", exc)
+        tracker = await self._submit_backpack_market(
+            size_i=size_i,
+            is_ask=self._direction_long,
+            reduce_only=1,
+            label="bp_flatten",
+            attempts=self.params.backpack_entry_max_attempts,
+            retry_delay=self.params.backpack_retry_delay_secs,
+            log_errors=emergency,
+        )
+        if tracker is None:
+            self.log.error("flatten backpack failed size_i=%s", size_i)
 
-    def _resolve_filled(self, tracker: TrackingLimitOrder, size_scale: int, fallback: int) -> int:
+    def _resolve_market_filled(self, tracker: TrackingMarketOrder, size_scale: int, fallback: int) -> int:
         snap = tracker.snapshot()
-        if snap.filled_base is not None:
+        if snap and snap.filled_base is not None:
             try:
                 amount = abs(float(snap.filled_base))
                 amount_i = int(round(amount * size_scale))
@@ -924,13 +920,26 @@ class LiquidationHedgeStrategy(StrategyBase):
             self.log.debug("unable to load telegram keys: %s", exc)
 
     # --- utility methods ----------------------------------------------
+    def _coi_limit(self, key: str) -> int:
+        k = key.lower()
+        if k.startswith("bp") or k.startswith("backpack"):
+            return COI_LIMIT_BACKPACK
+        return COI_LIMIT_LIGHTER
+
     def _next_coi(self, key: str) -> int:
-        seq = self._coi_seq.get(key, 1)
-        seq += 1
-        if seq > COI_LIMIT:
-            seq = 1
-        self._coi_seq[key] = seq
-        return seq
+        limit = self._coi_limit(key)
+        seq = self._coi_seq.get(key)
+        if seq is None or seq <= 0 or seq > limit:
+            seed = int(time.time() * 1000) % limit
+            if seed <= 0:
+                seed = 1
+            self._coi_seq[key] = seed
+        else:
+            seq += 1
+            if seq > limit:
+                seq = 1
+            self._coi_seq[key] = seq
+        return self._coi_seq[key]
 
     def _api_key_index(self, connector: Any) -> Optional[int]:
         signer = getattr(connector, "signer", None)

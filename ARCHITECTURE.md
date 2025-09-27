@@ -1,50 +1,74 @@
-# XTradingBot Architecture
+# XTradingBot Architecture (2025-09 update)
 
-XTradingBot is organised as a three-layer stack that keeps strategy logic decoupled from exchange execution and connectivity concerns.
+XTradingBot follows a three-layer architecture – **Strategy**, **Execution**, and **Connector** – orchestrated by the unified runner. Recent work introduced a production-ready liquidation-hedge strategy, richer diagnostics, and a telemetry stack to monitor multi-account deployments.
 
 ## 1. Strategy Layer
-- Contains trading logic in `mm_bot/strategy/*`.
-- Strategies inherit from `StrategyBase` and are life-cycle managed by `TradingCore`.
-- Strategies obtain connectors through the runner registry and rely on execution helpers (e.g. tracking orders) exposed by the execution layer.
-- The smoke-test strategy (`ConnectorSmokeTestStrategy`) now drives a **tracking limit** diagnostic: it re-posts a limit order at top-of-book until filled, verifies order-state updates from both REST and websocket feeds, flattens the fill with a reduce-only market order, and confirms no residual exposure remains.
+
+### Core Principles
+- Strategies live in `mm_bot/strategy/*`, inherit from `StrategyBase`, and are lifecycle-managed by `TradingCore` (start/stop/on_tick).
+- Each strategy receives named connectors from the runner registry and interacts with them through the execution helpers (`submit_market_order`, trackers, etc.).
+
+### Production Strategy: `LiquidationHedgeStrategy`
+- Location: `mm_bot/strategy/liquidation_hedge.py`.
+- Purpose: run a three-venue liquidation hedge between Backpack and two Lighter accounts.
+- Flow per cycle:
+  1. **Backpack entry** – now uses market orders; COI capped at 2^32-1 to satisfy Backpack limits.
+  2. **Lighter1 hedge** – submit market order, wait for position delta > 20% of the requested size, and log API key / nonce state.
+  3. **Random wait** – uniform delay between `wait_min_secs` and `wait_max_secs` to stagger L2 entry.
+  4. **Lighter2 entry** – same market + confirmation logic.
+  5. **Backpack rebalance** – market order to drive `bp ≈ -(l1 + l2)`; failure triggers an emergency exit.
+  6. **Monitoring** – heartbeat-style monitoring of all three venues; if any side returns to ~0 or timeout is reached we flatten and alert.
+- Telemetry & notifications:
+  - Reads `mm_bot/conf/telemetry.json` (base_url/token/group/bot names) to post heartbeats to the self-hosted dashboard.
+  - Uses `tg_key.txt` to send Telegram messages on start/finish/emergency exit.
+- Nonce/COI handling: Lighter uses 48-bit COIs + hard-refresh on `21104`; Backpack uses 32-bit COIs; all submissions are serialised per venue lock.
+
+### Diagnostics: `LighterMinOrderStrategy`
+- Added in `mm_bot/strategy/lighter_min_order.py`.
+- Submits minimal market orders to lighter1 and lighter2, logging COI, API key, nonce state, and the raw response for troubleshooting (`21104`, partial fills, etc.).
+
+### Other Strategies
+- The smoke test (`ConnectorSmokeTestStrategy`) remains available for connection diagnostics.
+- Legacy strategies (trend ladder, geometric grid, AS model) are still present in the repo.
 
 ## 2. Execution Layer
-- Located in `mm_bot/execution/`.
-- `OrderTracker` maintains the order state machine (`NEW → SUBMITTING → OPEN → PARTIALLY_FILLED → FILLED/CANCELLED/FAILED`).
-- `TrackingLimitOrder`/`TrackingMarketOrder` expose awaitable helpers so strategies can `await order.wait_final(...)` or stream incremental updates.
-- `tracking_limit.py` adds `place_tracking_limit_order()`, a reusable helper that keeps replacing a limit order at the best bid/ask until it fills or times out, abstracting the loop that the smoke test (and future strategies) can reuse.
-- Connectors inherit from `BaseConnector` to integrate tracking, fan out events, and provide consistent debug logging. The base automatically dispatches callbacks and logs every transition when debug mode is enabled.
+- Located in `mm_bot/execution/*`.
+- `OrderTracker` keeps per-order state; `TrackingMarketOrder`/`TrackingLimitOrder` expose awaitable helpers.
+- `tracking_limit.py` still powers the smoke test; production strategies now primarily use connector-provided `submit_market_order` wrappers with local serialisation, COI limits, nonce refresh, and detailed logging.
 
 ## 3. Connector Layer
-- Live in `mm_bot/connector/*` and now share the `BaseConnector` implementation.
-- Responsibilities:
-  - Start/stop exchange sessions (REST + WebSocket).
-  - Map exchange-specific payloads to the common order state machine.
-  - Expose higher level helpers (`submit_limit_order`, `submit_market_order`) that wrap raw REST/Signed calls and register tracking metadata.
-  - Emit unified events (`ORDER`, `TRADE`, `POSITION`) to subscribed listeners.
-- `BackpackConnector` and `LighterConnector` translate exchange statuses into state transitions while preserving existing functionality. `GrvtConnector` inherits the base skeleton and can be extended when the SDK is fully wired in.
+- All connectors inherit from `BaseConnector` for consistent order tracking and event fan-out.
+- **BackpackConnector** – `submit_market_order()` exposes REST market execution (fills include `executedQuantity`); COI limited to 2^32.
+- **LighterConnector** – uses the official signer SDK; nonce manager switched to API mode; `get_positions()` provides `{sign, position}` so strategies can compute `sign * position`.
+- Each connector exports helpers (`get_market_info`, `get_price_size_decimals`) so strategies can convert float amounts to integer units.
 
-## Runner & Registry
-- The unified `mm_bot/bin/runner.py` replaces the legacy `run_*.py` entrypoints.
-- `mm_bot/runtime/builders.py` + `registry.py` resolve connectors and strategies declared in configuration files. Strategies can opt into dynamic connector resolution (e.g. `smoke_test` enumerates connectors listed under its configuration block).
-- `build_smoke_test_strategy()` now understands per-connector tracking intervals, timeouts, and cancel-wait settings so diagnostics can be tuned per venue.
-- The runner waits for `TradingCore` to stop (signalled by the strategy) and exits with a non-zero code when the smoke test reports a failure.
-- Legacy entrypoints are archived under `mm_bot/bin/legacy/` for reference.
+## Runner & Builders
+- Unified runner: `mm_bot/bin/runner.py`.
+- `mm_bot/runtime/builders.py`:
+  - `build_liquidation_hedge_strategy` now requires connectors `backpack`, `lighter1`, `lighter2` and forwards telemetry / notification settings.
+  - `build_lighter_min_order_strategy` accepts a list of targets (`connector`, `direction`, `reduce_only`, `size_multiplier`).
+- Registry (`mm_bot/runtime/registry.py`) resolves connectors/strategies declared in configuration files.
 
-## Connector Enhancements
-- Connectors expose uniform metadata helpers (`get_market_info`, `get_price_size_decimals`, `get_top_of_book`) so the tracking helper can compute tick/size integers without duplicating logic.
-- `BackpackConnector`, `LighterConnector`, and `GrvtConnector` surface both REST-derived and websocket-cached views of orders/positions, enabling the smoke test to cross-check state across transports.
-- Websocket bootstrap happens inside `prepare_smoke_test` so the first market snapshot reflects live data before we submit the diagnostic orders.
+## Telemetry & Dashboard
+- Config: `mm_bot/conf/telemetry.json` (base URL, token, group, per-role bot names).
+- Server: `deploy/server.js`
+  - `POST /ingest/:botName` ingests heartbeats.
+  - `GET /api/status` returns online/offline states.
+  - `POST /admin/prune` removes stale bots (same timeout rule as `/api/status`), honouring `x-auth-token` when configured.
+- Dashboard: `deploy/card.html`
+  - Buttons for refresh / prune / set token.
+  - Grouped cards for BP / L1 / L2, single-card fallback for legacy bots.
+  - Auto-refresh every 2 seconds.
 
-## Current Focus
-- Smoke-test infrastructure validates Backpack, Lighter, and GRVT connectivity end-to-end using the shared tracking-limit helper and per-connector configs.
-- Execution helpers are being consolidated so production strategies can reuse the same primitives the diagnostics employ.
+## Known Behaviour / Current Issues
+- Backpack rebalance may still log "unable to reach target" when floating precision or venue limits prevent flattening to exact zero.
+- If lighter2 position suddenly drops to zero while BP 调整仍在进行，监控线程会触发紧急退场（原因=`lighter2_zero`）。需要确认 Lighter 是否触发了 reduce-only 或风控。
+
+## Debug Tips
+- Set `general.debug: true` or `XTB_DEBUG=1` to enable detailed connector logs.
+- `LiquidationHedgeStrategy` logs INFO/WARN for market submissions, nonce refreshes, position confirmations, telemetry posts, and Telegram notifications.
 
 ## Next Steps
-1. Extend tracking diagnostics to cover reduce-only/partial-fill scenarios and surface richer telemetry.
-2. Draft connector development documentation that explains required hooks, shared helpers, and testing expectations.
-3. Begin onboarding the Aster exchange connector, reusing the shared `BaseConnector` instrumentation.
-
-## Debug & Logging
-- Enable detailed connector debug logs by setting `general.debug: true` or the `XTB_DEBUG=1` environment variable. When active, `BaseConnector` prints every order transition together with key metadata.
-- Per-strategy telemetry/logging options remain configurable through the existing YAML files.
+1. Investigate Backpack market rebalance failures（检查成交量/最小单位/保证金限制）。
+2. Enhance telemetry dashboard with execution warnings or alerts for heartbeat gaps。
+3. Consider richer Telegram notifications (per-role PnL, heartbeat misses, etc.).
