@@ -27,6 +27,7 @@ async def place_tracking_limit_order(
     reduce_only: int = 0,
     logger: Optional[Any] = None,
     max_attempts: Optional[int] = None,
+    coi_provider: Optional[Callable[[], int]] = None,
 ) -> TrackingLimitOrder:
     """Continuously re-post a limit order at the top of book until filled.
 
@@ -59,6 +60,12 @@ async def place_tracking_limit_order(
 
     def next_coi() -> int:
         nonlocal coi_seed
+        if coi_provider is not None:
+            try:
+                value = int(coi_provider())
+                return value if value > 0 else 1
+            except Exception:
+                pass
         coi_seed = (coi_seed + 1) % 1_000_000
         return coi_seed or 1
 

@@ -1,0 +1,34 @@
+general:
+  log_config: mm_bot/conf/logging.yaml
+  symbol: BTC_USDC_PERP
+
+connectors:
+  backpack:
+    base_url: https://api.backpack.exchange
+    ws_url: wss://ws.backpack.exchange
+    keys_file: Backpack_key.txt
+    broker_id: "1500"
+  lighter:
+    base_url: https://mainnet.zklighter.elliot.ai
+    keys_file: Lighter_key.txt
+    account_index: null
+    rpm: 4000
+
+strategy:
+  name: connector_test
+  connector_test:
+    pause_between_tests_secs: 2.0
+    test_mode: true
+    tasks:
+      - venue: backpack
+        symbol: BTC_USDC_PERP
+        order_type: tracking_limit
+        side: buy
+        price_offset_ticks: 1
+        tracking_interval_secs: 10.0
+        tracking_timeout_secs: 120.0
+      - venue: lighter
+        symbol: ETH
+        order_type: market
+        side: sell
+        min_multiplier: 1.0

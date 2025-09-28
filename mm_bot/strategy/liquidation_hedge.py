@@ -6,10 +6,11 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 import aiohttp
 
+from mm_bot.execution import ExecutionLayer, resolve_filled_amount, wait_random
 from mm_bot.execution.orders import OrderState, TrackingMarketOrder
 from mm_bot.strategy.strategy_base import StrategyBase
 
@@ -46,10 +47,7 @@ class LiquidationHedgeParams:
     confirmation_poll_secs: float = 0.2
     rebalance_max_attempts: int = 3
     rebalance_retry_delay_secs: float = 0.5
-    wait_min_secs: float = 2.0
-    wait_max_secs: float = 5.0
-    rebalance_max_attempts: int = 3
-    rebalance_retry_delay_secs: float = 0.5
+    test_mode: bool = False
     telemetry_enabled: bool = True
     telemetry_config_path: str = DEFAULT_TELEMETRY_CONFIG
     telemetry_interval_secs: float = 2.0
@@ -125,13 +123,10 @@ class LiquidationHedgeStrategy(StrategyBase):
         self._active: bool = True
 
         # market metadata
-        self._bp_price_scale: int = 1
         self._bp_size_scale: int = 1
         self._bp_min_size_i: int = 1
-        self._lg1_price_scale: int = 1
         self._lg1_size_scale: int = 1
         self._lg1_min_size_i: int = 1
-        self._lg2_price_scale: int = 1
         self._lg2_size_scale: int = 1
         self._lg2_min_size_i: int = 1
 
@@ -140,13 +135,19 @@ class LiquidationHedgeStrategy(StrategyBase):
         self._cycle_index: int = 0
         self._rng = random.Random()
 
-        # order sequencing
-        self._coi_seq: Dict[str, int] = {}
-        self._order_locks: Dict[str, asyncio.Lock] = {
-            "backpack": asyncio.Lock(),
-            "lighter1": asyncio.Lock(),
-            "lighter2": asyncio.Lock(),
-        }
+        # execution layer abstraction
+        self._canonical_symbol = "HEDGE"
+        self.execution = ExecutionLayer(logger=self.log)
+        self.execution.register_connector("backpack", self.backpack, coi_limit=COI_LIMIT_BACKPACK)
+        self.execution.register_connector("lighter1", self.lighter1, coi_limit=COI_LIMIT_LIGHTER)
+        self.execution.register_connector("lighter2", self.lighter2, coi_limit=COI_LIMIT_LIGHTER)
+        self.execution.register_symbol(
+            self._canonical_symbol,
+            backpack=self.params.backpack_symbol,
+            lighter1=self.params.lighter_symbol,
+            lighter2=self.params.lighter_symbol,
+        )
+        self._test_mode_sizes: Dict[str, int] = {}
 
         # telemetry / notifications
         self._telemetry_cfg: Optional[Dict[str, Any]] = None
@@ -208,39 +209,42 @@ class LiquidationHedgeStrategy(StrategyBase):
 
     async def _prepare_markets(self) -> None:
         await self.backpack.start_ws_state([self.params.backpack_symbol])
-        await self.backpack._ensure_markets()
-        bp_p_dec, bp_s_dec = await self.backpack.get_price_size_decimals(self.params.backpack_symbol)
-        self._bp_price_scale = 10 ** bp_p_dec
-        self._bp_size_scale = 10 ** bp_s_dec
-        bp_info = await self.backpack.get_market_info(self.params.backpack_symbol)
-        bp_step = float(bp_info.get("step_size") or bp_info.get("min_qty") or 0.0)
-        self._bp_min_size_i = max(1, int(round(bp_step * self._bp_size_scale)))
-
         await self.lighter1.start_ws_state()
-        await self.lighter1._ensure_markets()
-        lg1_p_dec, lg1_s_dec = await self.lighter1.get_price_size_decimals(self.params.lighter_symbol)
-        self._lg1_price_scale = 10 ** lg1_p_dec
-        self._lg1_size_scale = 10 ** lg1_s_dec
-        self._lg1_min_size_i = max(1, await self.lighter1.get_min_order_size_i(self.params.lighter_symbol))
-
         await self.lighter2.start_ws_state()
-        await self.lighter2._ensure_markets()
-        lg2_p_dec, lg2_s_dec = await self.lighter2.get_price_size_decimals(self.params.lighter_symbol)
-        self._lg2_price_scale = 10 ** lg2_p_dec
-        self._lg2_size_scale = 10 ** lg2_s_dec
-        self._lg2_min_size_i = max(1, await self.lighter2.get_min_order_size_i(self.params.lighter_symbol))
+
+        self._bp_size_scale = await self.execution.size_scale("backpack", self._canonical_symbol)
+        self._bp_min_size_i = await self.execution.min_size_i("backpack", self._canonical_symbol)
+        self._lg1_size_scale = await self.execution.size_scale("lighter1", self._canonical_symbol)
+        self._lg1_min_size_i = await self.execution.min_size_i("lighter1", self._canonical_symbol)
+        self._lg2_size_scale = await self.execution.size_scale("lighter2", self._canonical_symbol)
+        self._lg2_min_size_i = await self.execution.min_size_i("lighter2", self._canonical_symbol)
+
+        if self.params.test_mode:
+            base_min = max(self._bp_min_size_i, self._lg1_min_size_i, self._lg2_min_size_i)
+            def align(min_size: int) -> int:
+                return max(min_size, ((base_min + min_size - 1) // min_size) * min_size)
+
+            self._test_mode_sizes = {
+                "backpack": align(self._bp_min_size_i),
+                "lighter1": align(self._lg1_min_size_i),
+                "lighter2": align(self._lg2_min_size_i),
+            }
+        else:
+            self._test_mode_sizes = {}
 
     # ------------------------------------------------------------------
     async def _execute_cycle(self) -> bool:
         ctx = CycleContext(cycle_id=f"{int(time.time() * 1000)}-{self._cycle_index}")
         ctx.start_snapshot = await self._snapshot_positions()
         ctx.start_collateral_bp = await self._fetch_backpack_collateral()
-        ctx.start_collateral_l1 = await self._fetch_lighter_collateral(self.lighter1)
-        ctx.start_collateral_l2 = await self._fetch_lighter_collateral(self.lighter2)
+        ctx.start_collateral_l1 = await self._fetch_lighter_collateral("lighter1")
+        ctx.start_collateral_l2 = await self._fetch_lighter_collateral("lighter2")
 
         try:
-            ctx.l1_plan = await self._plan_lighter_size(self.lighter1, self._lg1_size_scale, self._lg1_min_size_i)
-            ctx.l2_plan = await self._plan_lighter_size(self.lighter2, self._lg2_size_scale, self._lg2_min_size_i)
+            override_l1 = self._test_mode_sizes.get("lighter1") if self.params.test_mode else None
+            override_l2 = self._test_mode_sizes.get("lighter2") if self.params.test_mode else None
+            ctx.l1_plan = await self._plan_lighter_size("lighter1", override_size_i=override_l1)
+            ctx.l2_plan = await self._plan_lighter_size("lighter2", override_size_i=override_l2)
         except Exception as exc:
             self.log.error("unable to compute order size: %s", exc)
             return False
@@ -279,8 +283,11 @@ class LiquidationHedgeStrategy(StrategyBase):
 
     # --- stage helpers -------------------------------------------------
     async def _stage_bp_entry(self, ctx: CycleContext) -> bool:
-        size_base = ctx.l1_plan.base_amount if ctx.l1_plan else 0.0
-        ctx.bp_entry_size_i = max(self._bp_min_size_i, int(round(size_base * self._bp_size_scale)))
+        if self.params.test_mode:
+            ctx.bp_entry_size_i = self._test_mode_sizes.get("backpack", self._bp_min_size_i)
+        else:
+            size_base = ctx.l1_plan.base_amount if ctx.l1_plan else 0.0
+            ctx.bp_entry_size_i = max(self._bp_min_size_i, int(round(size_base * self._bp_size_scale)))
 
         tracker = await self._submit_backpack_market(
             size_i=ctx.bp_entry_size_i,
@@ -290,12 +297,15 @@ class LiquidationHedgeStrategy(StrategyBase):
         )
         if tracker is None:
             return False
-        ctx.bp_filled_i = self._resolve_market_filled(tracker, self._bp_size_scale, ctx.bp_entry_size_i)
+        ctx.bp_filled_i = resolve_filled_amount(tracker, size_scale=self._bp_size_scale, fallback=ctx.bp_entry_size_i)
         if ctx.bp_filled_i <= 0:
             self.log.error("unable to resolve filled amount; aborting")
             return False
         ctx.bp_entry_base = ctx.bp_filled_i / float(self._bp_size_scale)
-        ctx.l1_size_i = max(self._lg1_min_size_i, int(round(ctx.bp_entry_base * self._lg1_size_scale)))
+        if self.params.test_mode:
+            ctx.l1_size_i = self._test_mode_sizes.get("lighter1", self._lg1_min_size_i)
+        else:
+            ctx.l1_size_i = max(self._lg1_min_size_i, int(round(ctx.bp_entry_base * self._lg1_size_scale)))
         self.log.info("cycle %s backpack filled base=%.6f size_i=%s", ctx.cycle_id, ctx.bp_entry_base, ctx.bp_filled_i)
         return True
 
@@ -303,7 +313,7 @@ class LiquidationHedgeStrategy(StrategyBase):
         is_ask = self._direction_long
         size_i = max(ctx.l1_size_i, self._lg1_min_size_i)
         success = await self._submit_lighter_market(
-            connector=self.lighter1,
+            venue="lighter1",
             size_i=size_i,
             is_ask=is_ask,
             reduce_only=0,
@@ -314,7 +324,7 @@ class LiquidationHedgeStrategy(StrategyBase):
             await self._flatten_backpack(ctx.bp_filled_i, emergency=True)
             return False
         pos = await self._confirm_position(
-            connector=self.lighter1,
+            venue="lighter1",
             baseline=ctx.start_snapshot.l1 if ctx.start_snapshot else 0.0,
             expected_sign=-1 if self._direction_long else 1,
             size_i=size_i,
@@ -333,14 +343,16 @@ class LiquidationHedgeStrategy(StrategyBase):
         wait_max = max(self.params.wait_min_secs, self.params.wait_max_secs)
         if wait_max <= 0:
             return
-        delay = self._rng.uniform(max(0.0, wait_min), wait_max)
+        delay = await wait_random(max(0.0, wait_min), wait_max, rng=self._rng)
         self.log.info("waiting %.2fs before lighter2 entry", delay)
-        await asyncio.sleep(delay)
 
     async def _stage_l2_entry(self, ctx: CycleContext) -> bool:
-        size_i = max(self._lg2_min_size_i, int(round(ctx.bp_entry_base * self._lg2_size_scale)))
+        if self.params.test_mode:
+            size_i = self._test_mode_sizes.get("lighter2", self._lg2_min_size_i)
+        else:
+            size_i = max(self._lg2_min_size_i, int(round(ctx.bp_entry_base * self._lg2_size_scale)))
         success = await self._submit_lighter_market(
-            connector=self.lighter2,
+            venue="lighter2",
             size_i=size_i,
             is_ask=not self._direction_long,
             reduce_only=0,
@@ -350,7 +362,7 @@ class LiquidationHedgeStrategy(StrategyBase):
         if not success:
             return False
         pos = await self._confirm_position(
-            connector=self.lighter2,
+            venue="lighter2",
             baseline=ctx.start_snapshot.l2 if ctx.start_snapshot else 0.0,
             expected_sign=1 if self._direction_long else -1,
             size_i=size_i,
@@ -364,8 +376,8 @@ class LiquidationHedgeStrategy(StrategyBase):
         return True
 
     async def _stage_rebalance(self, ctx: CycleContext) -> bool:
-        l1_pos = await self._get_lighter_position(self.lighter1)
-        l2_pos = await self._get_lighter_position(self.lighter2)
+        l1_pos = await self._get_lighter_position("lighter1")
+        l2_pos = await self._get_lighter_position("lighter2")
         target = -(l1_pos + l2_pos)
         success = await self._rebalance_backpack(target)
         if success:
@@ -386,8 +398,8 @@ class LiquidationHedgeStrategy(StrategyBase):
                     await self._emergency_exit(ctx, reason="timeout")
                     return False
 
-                l1_pos = await self._get_lighter_position(self.lighter1)
-                l2_pos = await self._get_lighter_position(self.lighter2)
+                l1_pos = await self._get_lighter_position("lighter1")
+                l2_pos = await self._get_lighter_position("lighter2")
                 if abs(l1_pos) <= POSITION_EPS:
                     await self._emergency_exit(ctx, reason="lighter1_zero")
                     return False
@@ -407,119 +419,52 @@ class LiquidationHedgeStrategy(StrategyBase):
         return True
 
     # --- helpers -------------------------------------------------------
-    async def _plan_lighter_size(self, connector: Any, size_scale: int, min_size_i: int) -> Optional[VenueOrderPlan]:
-        try:
-            overview = await connector.get_account_overview()
-        except Exception as exc:
-            self.log.error("%s account overview failed: %s", getattr(connector, "name", "lighter"), exc)
+    async def _plan_lighter_size(self, venue: str, *, override_size_i: Optional[int] = None) -> Optional[VenueOrderPlan]:
+        if self.params.test_mode and override_size_i is not None:
+            collateral = await self._fetch_lighter_collateral(venue)
+            size_scale = self._lg1_size_scale if venue == "lighter1" else self._lg2_size_scale
+            base_amount = override_size_i / float(size_scale or 1)
+            return VenueOrderPlan(base_amount=base_amount, size_i=override_size_i, collateral=collateral)
+
+        plan = await self.execution.plan_order_size(
+            venue,
+            self._canonical_symbol,
+            leverage=self.params.leverage,
+            min_collateral=self.params.min_collateral,
+            collateral_buffer=0.96,
+        )
+        if not plan:
+            self.log.error("%s collateral/market data unavailable", venue)
             return None
-        accounts = overview.get("accounts") if isinstance(overview, dict) else None
-        if not accounts:
-            return None
-        account = accounts[0]
-        collateral = float(account.get("collateral") or account.get("available_balance") or account.get("equity") or 0.0)
-        if collateral <= max(self.params.min_collateral, 0.0):
-            self.log.error("lighter collateral %.6f below minimum", collateral)
-            return None
-        top_bid_i, top_ask_i, scale = await connector.get_top_of_book(self.params.lighter_symbol)
-        if top_bid_i is None and top_ask_i is None:
-            return None
-        price_i = top_ask_i if self._direction_long else top_bid_i
-        if price_i is None:
-            price_i = top_bid_i or top_ask_i
-        price = price_i / float(scale or 1)
-        if price <= 0:
-            return None
-        leverage = max(self.params.leverage, 1.0)
-        eff_collateral = collateral * 0.96
-        notional = eff_collateral * leverage
-        base_amount = notional / price
-        size_i = max(min_size_i, int(round(base_amount * size_scale)))
-        if size_i <= 0:
-            return None
-        return VenueOrderPlan(base_amount=base_amount, size_i=size_i, collateral=collateral)
+        return VenueOrderPlan(
+            base_amount=plan["base_amount"],
+            size_i=plan["size_i"],
+            collateral=plan["collateral"],
+        )
 
     async def _submit_lighter_market(
         self,
         *,
-        connector: Any,
+        venue: str,
         size_i: int,
         is_ask: bool,
         reduce_only: int,
         max_slippage: float,
         label: str,
     ) -> bool:
-        key = label
-        api_key_index = self._api_key_index(connector)
-        lock = self._order_locks.setdefault(key, asyncio.Lock())
-        max_attempts = max(int(self.params.lighter_hedge_max_attempts or 1), 1)
-        retry_delay = max(float(self.params.lighter_retry_delay_secs or 0.0), 0.0)
-
-        for attempt in range(1, max_attempts + 1):
-            try:
-                async with lock:
-                    coi = self._next_coi(key)
-                    nonce_state = self._nonce_snapshot(connector)
-                    self.log.info(
-                        "%s attempt=%s submit coi=%s api_key=%s nonce=%s size_i=%s is_ask=%s reduce_only=%s max_slippage=%.6f",
-                        label,
-                        attempt,
-                        coi,
-                        api_key_index,
-                        nonce_state,
-                        size_i,
-                        is_ask,
-                        reduce_only,
-                        max_slippage,
-                    )
-                    tracker = await connector.submit_market_order(
-                        symbol=self.params.lighter_symbol,
-                        client_order_index=coi,
-                        base_amount=size_i,
-                        is_ask=is_ask,
-                        reduce_only=reduce_only,
-                        max_slippage=max_slippage if max_slippage > 0 else None,
-                    )
-                await tracker.wait_final(timeout=30.0)
-            except Exception as exc:
-                self.log.error("%s market order attempt=%s failed: %s", label, attempt, exc)
-                tracker = None
-
-            if tracker and tracker.state == OrderState.FILLED:
-                self.log.info("%s attempt=%s filled nonce=%s", label, attempt, self._nonce_snapshot(connector))
-                return True
-
-            snapshot = tracker.snapshot() if tracker else None
-            info = snapshot.info if snapshot else None
-            reason = getattr(tracker, "last_error", None) or getattr(tracker, "reject_reason", None)
-            if reason is None and info:
-                reason = info.get("error") or info.get("message")
-            info_short = self._shorten_info(info)
-            nonce_after = self._nonce_snapshot(connector)
-            self.log.warning(
-                "%s attempt=%s state=%s reason=%s api_key=%s nonce_state=%s info=%s",
-                label,
-                attempt,
-                getattr(tracker.state, "value", tracker.state) if tracker else "error",
-                reason,
-                api_key_index,
-                nonce_after,
-                info_short,
-            )
-
-            info_code = ""
-            if isinstance(info, dict):
-                info_code = str(info.get("code") or "")
-            reason_text = str(reason or "").lower()
-            if "invalid nonce" in reason_text or info_code == "21104":
-                await self._refresh_nonce(connector, api_key_index)
-                if retry_delay:
-                    await asyncio.sleep(retry_delay * max(1, attempt))
-                continue
-
-            if attempt < max_attempts and retry_delay:
-                await asyncio.sleep(retry_delay)
-        return False
+        tracker = await self.execution.market_order(
+            venue,
+            self._canonical_symbol,
+            size_i=size_i,
+            is_ask=is_ask,
+            reduce_only=reduce_only,
+            max_slippage=max_slippage if max_slippage > 0 else None,
+            attempts=int(self.params.lighter_hedge_max_attempts or 1),
+            retry_delay=float(self.params.lighter_retry_delay_secs or 0.0),
+            wait_timeout=30.0,
+            label=label,
+        )
+        return bool(tracker and tracker.state == OrderState.FILLED)
 
     async def _submit_backpack_market(
         self,
@@ -534,62 +479,36 @@ class LiquidationHedgeStrategy(StrategyBase):
     ) -> Optional[TrackingMarketOrder]:
         if size_i <= 0:
             return None
-        max_attempts = max(int(attempts or self.params.backpack_entry_max_attempts or 1), 1)
-        delay = retry_delay if retry_delay is not None else max(float(self.params.backpack_retry_delay_secs or 0.0), 0.0)
-        lock = self._order_locks.setdefault("backpack", asyncio.Lock())
-        for attempt in range(1, max_attempts + 1):
-            try:
-                async with lock:
-                    coi = self._next_coi("backpack")
-                    self.log.info(
-                        "%s attempt=%s submit coi=%s size_i=%s is_ask=%s reduce_only=%s",
-                        label,
-                        attempt,
-                        coi,
-                        size_i,
-                        is_ask,
-                        reduce_only,
-                    )
-                    tracker: TrackingMarketOrder = await self.backpack.submit_market_order(
-                        symbol=self.params.backpack_symbol,
-                        client_order_index=coi,
-                        base_amount=size_i,
-                        is_ask=is_ask,
-                        reduce_only=reduce_only,
-                    )
-                await tracker.wait_final(timeout=30.0)
-            except Exception as exc:
-                if log_errors:
-                    self.log.error("%s market order attempt=%s failed: %s", label, attempt, exc)
-                tracker = None
-
-            if tracker and tracker.state == OrderState.FILLED:
-                self.log.info("%s attempt=%s filled", label, attempt)
-                return tracker
-
-            state = tracker.state.value if tracker else "error"
-            info = tracker.snapshot().info if tracker else None
-            reason = None
-            if tracker is not None:
-                reason = getattr(tracker, "last_error", None) or getattr(tracker, "reject_reason", None)
-            if reason is None and isinstance(info, dict):
-                reason = info.get("error") or info.get("message") or info.get("reason")
+        attempts_val = int(attempts or self.params.backpack_entry_max_attempts or 1)
+        retry = float(retry_delay if retry_delay is not None else self.params.backpack_retry_delay_secs or 0.0)
+        tracker = await self.execution.market_order(
+            "backpack",
+            self._canonical_symbol,
+            size_i=size_i,
+            is_ask=is_ask,
+            reduce_only=reduce_only,
+            attempts=max(attempts_val, 1),
+            retry_delay=retry,
+            wait_timeout=30.0,
+            label=label,
+        )
+        if tracker and tracker.state == OrderState.FILLED:
             if log_errors:
-                self.log.warning(
-                    "%s attempt=%s ended state=%s reason=%s info=%s",
-                    label,
-                    attempt,
-                    state,
-                    reason,
-                    self._shorten_info(info),
-                )
-            if attempt < max_attempts and delay:
-                await asyncio.sleep(delay)
-        return None
+                self.log.info("%s filled", label)
+            return tracker
+        if log_errors and tracker is not None:
+            info = tracker.snapshot().info if tracker else None
+            self.log.warning(
+                "%s ended state=%s info=%s",
+                label,
+                tracker.state.value,
+                self._shorten_info(info),
+            )
+        return tracker
 
     async def _confirm_position(
         self,
-        connector: Any,
+        venue: str,
         baseline: float,
         expected_sign: int,
         *,
@@ -599,93 +518,54 @@ class LiquidationHedgeStrategy(StrategyBase):
     ) -> Optional[float]:
         timeout = max(float(self.params.confirmation_timeout_secs or 0.0), 1.0)
         poll = max(float(self.params.confirmation_poll_secs or 0.0), 0.1)
-        deadline = time.time() + timeout
         base_size = abs(size_i) / float(size_scale or 1)
-        min_change = max(base_size * 0.2, 1e-6)
+        tolerance = max(base_size * 0.2, 1e-6)
+        target = baseline + (expected_sign * base_size)
         self.log.info(
-            "%s confirm baseline=%.6f expected_sign=%s min_change=%.8f timeout=%.2fs",
+            "%s confirm target=%.6f baseline=%.6f tolerance=%.8f",
             label,
+            target,
             baseline,
-            expected_sign,
-            min_change,
-            timeout,
+            tolerance,
         )
-        while time.time() <= deadline:
-            pos = await self._get_lighter_position(connector)
-            delta = pos - baseline
-            if expected_sign > 0 and delta >= min_change:
-                self.log.info("%s confirm success pos=%.6f delta=%.6f", label, pos, delta)
-                return pos
-            if expected_sign < 0 and delta <= -min_change:
-                self.log.info("%s confirm success pos=%.6f delta=%.6f", label, pos, delta)
-                return pos
-            await asyncio.sleep(poll)
+        result = await self.execution.confirm_position(
+            venue,
+            self._canonical_symbol,
+            target=target,
+            tolerance=tolerance,
+            timeout=timeout,
+            poll_interval=poll,
+        )
+        if result is not None:
+            self.log.info("%s confirm success pos=%.6f", label, result)
+            return result
+        last_pos = await self._get_lighter_position(venue)
         self.log.warning(
-            "%s confirm timeout baseline=%.6f last_pos=%.6f min_change=%.6f",
+            "%s confirm timeout baseline=%.6f last_pos=%.6f tolerance=%.6f",
             label,
             baseline,
-            await self._get_lighter_position(connector),
-            min_change,
+            last_pos,
+            tolerance,
         )
         return None
 
     async def _rebalance_backpack(self, target_base: float) -> bool:
-        attempts = max(int(self.params.rebalance_max_attempts or 1), 1)
-        retry_delay = max(float(self.params.rebalance_retry_delay_secs or 0.0), 0.0)
-        lock = self._order_locks.setdefault("backpack", asyncio.Lock())
-        for attempt in range(1, attempts + 1):
-            current = await self._get_backpack_position()
-            delta = target_base - current
-            if abs(delta) <= POSITION_EPS:
-                return True
-            is_ask = delta < 0
-            size_i = max(self._bp_min_size_i, int(round(abs(delta) * self._bp_size_scale)))
-            try:
-                async with lock:
-                    coi = self._next_coi("backpack")
-                    tracker = await self.backpack.submit_market_order(
-                        symbol=self.params.backpack_symbol,
-                        client_order_index=coi,
-                        base_amount=size_i,
-                        is_ask=is_ask,
-                        reduce_only=0,
-                    )
-                await tracker.wait_final(timeout=30.0)
-            except Exception as exc:
-                self.log.error("backpack rebalance attempt=%s failed: %s", attempt, exc)
-                tracker = None
-            if tracker and tracker.state == OrderState.FILLED:
-                continue
-            if attempt < attempts and retry_delay:
-                await asyncio.sleep(retry_delay)
-        self.log.error("backpack rebalance unable to reach target=%.8f", target_base)
-        return False
+        return await self.execution.rebalance(
+            "backpack",
+            self._canonical_symbol,
+            target=target_base,
+            tolerance=POSITION_EPS,
+            attempts=self.params.rebalance_max_attempts or 1,
+            retry_delay=self.params.rebalance_retry_delay_secs or 0.0,
+        )
 
     async def _emergency_exit(self, ctx: CycleContext, *, reason: str) -> None:
         self.log.warning("cycle %s emergency exit reason=%s", ctx.cycle_id, reason)
-        bp_pos = await self._get_backpack_position()
-        if abs(bp_pos) > POSITION_EPS:
-            await self._flatten_backpack(int(round(abs(bp_pos) * self._bp_size_scale)), emergency=True)
-
-        for label, connector in (("lighter1", self.lighter1), ("lighter2", self.lighter2)):
-            pos = await self._get_lighter_position(connector)
-            if abs(pos) <= POSITION_EPS:
-                continue
-            is_ask = pos > 0
-            size_scale = self._lg1_size_scale if connector is self.lighter1 else self._lg2_size_scale
-            size_i = int(round(abs(pos) * size_scale))
-            await self._submit_lighter_market(
-                connector=connector,
-                size_i=size_i,
-                is_ask=is_ask,
-                reduce_only=1,
-                max_slippage=self.params.lighter_max_slippage,
-                label=label,
-            )
+        await self.execution.unwind_all(canonical_symbol=self._canonical_symbol, tolerance=POSITION_EPS)
 
         end_bp = await self._fetch_backpack_collateral()
-        end_l1 = await self._fetch_lighter_collateral(self.lighter1)
-        end_l2 = await self._fetch_lighter_collateral(self.lighter2)
+        end_l1 = await self._fetch_lighter_collateral("lighter1")
+        end_l2 = await self._fetch_lighter_collateral("lighter2")
 
         pnl_bp = end_bp - ctx.start_collateral_bp
         pnl_l1 = end_l1 - ctx.start_collateral_l1
@@ -695,8 +575,8 @@ class LiquidationHedgeStrategy(StrategyBase):
             f"[LiquidationHedge] 紧急退出 cycle={ctx.cycle_id} reason={reason}\n"
             f"PnL BP={pnl_bp:.4f} L1={pnl_l1:.4f} L2={pnl_l2:.4f}\n"
             f"Positions: bp={await self._get_backpack_position():.6f} "
-            f"l1={await self._get_lighter_position(self.lighter1):.6f} "
-            f"l2={await self._get_lighter_position(self.lighter2):.6f}"
+            f"l1={await self._get_lighter_position('lighter1'):.6f} "
+            f"l2={await self._get_lighter_position('lighter2'):.6f}"
         )
         await self._send_telegram(msg)
 
@@ -714,30 +594,6 @@ class LiquidationHedgeStrategy(StrategyBase):
         )
         if tracker is None:
             self.log.error("flatten backpack failed size_i=%s", size_i)
-
-    def _resolve_market_filled(self, tracker: TrackingMarketOrder, size_scale: int, fallback: int) -> int:
-        snap = tracker.snapshot()
-        if snap and snap.filled_base is not None:
-            try:
-                amount = abs(float(snap.filled_base))
-                amount_i = int(round(amount * size_scale))
-                if amount_i > 0:
-                    return amount_i
-            except Exception:
-                pass
-        inner = getattr(tracker, "_tracker", None)
-        if inner is not None:
-            for past in reversed(inner.history):
-                filled = getattr(past, "filled_base", None)
-                if filled is not None:
-                    try:
-                        amount = abs(float(filled))
-                        amount_i = int(round(amount * size_scale))
-                        if amount_i > 0:
-                            return amount_i
-                    except Exception:
-                        continue
-        return fallback
 
     # --- telemetry & notifications ------------------------------------
     async def _notify_start(self) -> None:
@@ -828,12 +684,12 @@ class LiquidationHedgeStrategy(StrategyBase):
         payloads: Dict[str, Dict[str, Any]] = {}
 
         bp_pos = await self._get_backpack_position()
-        l1_pos = await self._get_lighter_position(self.lighter1)
-        l2_pos = await self._get_lighter_position(self.lighter2)
+        l1_pos = await self._get_lighter_position("lighter1")
+        l2_pos = await self._get_lighter_position("lighter2")
 
-        bp_overview = await self._safe_account_overview(self.backpack)
-        l1_overview = await self._safe_account_overview(self.lighter1)
-        l2_overview = await self._safe_account_overview(self.lighter2)
+        bp_overview = await self._safe_account_overview("backpack")
+        l1_overview = await self._safe_account_overview("lighter1")
+        l2_overview = await self._safe_account_overview("lighter2")
 
         payloads["BP"] = {
             "timestamp": timestamp,
@@ -920,140 +776,28 @@ class LiquidationHedgeStrategy(StrategyBase):
             self.log.debug("unable to load telegram keys: %s", exc)
 
     # --- utility methods ----------------------------------------------
-    def _coi_limit(self, key: str) -> int:
-        k = key.lower()
-        if k.startswith("bp") or k.startswith("backpack"):
-            return COI_LIMIT_BACKPACK
-        return COI_LIMIT_LIGHTER
-
-    def _next_coi(self, key: str) -> int:
-        limit = self._coi_limit(key)
-        seq = self._coi_seq.get(key)
-        if seq is None or seq <= 0 or seq > limit:
-            seed = int(time.time() * 1000) % limit
-            if seed <= 0:
-                seed = 1
-            self._coi_seq[key] = seed
-        else:
-            seq += 1
-            if seq > limit:
-                seq = 1
-            self._coi_seq[key] = seq
-        return self._coi_seq[key]
-
-    def _api_key_index(self, connector: Any) -> Optional[int]:
-        signer = getattr(connector, "signer", None)
-        for attr in ("api_key_index", "apiKeyIndex", "api_key_id"):
-            if getattr(signer, attr, None) is not None:
-                try:
-                    return int(getattr(signer, attr))
-                except Exception:
-                    return None
-        value = getattr(connector, "_api_key_index", None)
-        if value is not None:
-            try:
-                return int(value)
-            except Exception:
-                return None
-        return None
-
-    def _nonce_snapshot(self, connector: Any) -> Optional[str]:
-        signer = getattr(connector, "signer", None)
-        manager = getattr(signer, "nonce_manager", None)
-        mapping = getattr(manager, "nonce", None)
-        if isinstance(mapping, dict) and mapping:
-            try:
-                return ",".join(f"{k}:{mapping[k]}" for k in sorted(mapping))
-            except Exception:
-                return str(mapping)
-        return None
-
-    async def _refresh_nonce(self, connector: Any, api_key_index: Optional[int]) -> None:
-        signer = getattr(connector, "signer", None)
-        manager = getattr(signer, "nonce_manager", None)
-        if manager is None or api_key_index is None:
-            return
-        try:
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, manager.hard_refresh_nonce, api_key_index)
-            self.log.debug(
-                "%s refreshed nonce api_key=%s nonce_state=%s",
-                getattr(connector, "name", "lighter"),
-                api_key_index,
-                self._nonce_snapshot(connector),
-            )
-        except Exception as exc:
-            self.log.warning("%s nonce refresh failed api_key=%s error=%s", getattr(connector, "name", "lighter"), api_key_index, exc)
-
     async def _snapshot_positions(self) -> PositionSnapshot:
         bp = await self._get_backpack_position()
-        l1 = await self._get_lighter_position(self.lighter1)
-        l2 = await self._get_lighter_position(self.lighter2)
+        l1 = await self._get_lighter_position("lighter1")
+        l2 = await self._get_lighter_position("lighter2")
         return PositionSnapshot(bp=bp, l1=l1, l2=l2)
 
     async def _get_backpack_position(self) -> float:
-        try:
-            positions = await self.backpack.get_positions()
-        except Exception:
-            return 0.0
-        key = self._symbol_key(self.params.backpack_symbol)
-        for entry in positions:
-            sym = self._symbol_key(entry.get("symbol"))
-            if sym == key:
-                try:
-                    return float(entry.get("position") or entry.get("size") or 0.0)
-                except Exception:
-                    return 0.0
-        return 0.0
+        return await self.execution.position("backpack", self._canonical_symbol)
 
-    async def _get_lighter_position(self, connector: Any) -> float:
-        try:
-            positions = await connector.get_positions()
-        except Exception:
-            return 0.0
-        key = self._symbol_key(self.params.lighter_symbol)
-        for entry in positions:
-            sym = self._symbol_key(entry.get("symbol"))
-            if sym == key:
-                try:
-                    size = float(entry.get("position") or entry.get("netQuantity") or 0.0)
-                    sign = entry.get("sign")
-                    if sign is not None:
-                        size *= float(sign)
-                    return size
-                except Exception:
-                    return 0.0
-        return 0.0
+    async def _get_lighter_position(self, venue: str) -> float:
+        return await self.execution.position(venue, self._canonical_symbol)
 
     async def _fetch_backpack_collateral(self) -> float:
-        try:
-            data = await self.backpack.get_collateral()
-            if isinstance(data, dict):
-                for key in ("collateral", "totalCollateral", "effectiveCollateral", "equity"):
-                    if data.get(key) is not None:
-                        return float(data[key])
-        except Exception:
-            pass
-        return 0.0
+        return await self.execution.collateral("backpack")
 
-    async def _fetch_lighter_collateral(self, connector: Any) -> float:
-        try:
-            overview = await connector.get_account_overview()
-        except Exception:
-            return 0.0
-        accounts = overview.get("accounts") if isinstance(overview, dict) else None
-        if not accounts:
-            return 0.0
-        account = accounts[0]
-        for key in ("collateral", "available_balance", "balance", "equity"):
-            if account.get(key) is not None:
-                try:
-                    return float(account.get(key))
-                except Exception:
-                    continue
-        return 0.0
+    async def _fetch_lighter_collateral(self, venue: str) -> float:
+        return await self.execution.collateral(venue)
 
-    async def _safe_account_overview(self, connector: Any) -> Optional[Dict[str, Any]]:
+    async def _safe_account_overview(self, venue: str) -> Optional[Dict[str, Any]]:
+        connector = self.execution.connectors.get(venue.lower())
+        if connector is None:
+            return None
         try:
             data = await connector.get_account_overview()
             return data if isinstance(data, dict) else None

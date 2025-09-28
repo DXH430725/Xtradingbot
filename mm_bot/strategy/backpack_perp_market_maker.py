@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from .strategy_base import StrategyBase
-from mm_bot.connector.backpack.backpack_exchange import BackpackConnector
+from mm_bot.connector.backpack import BackpackConnector
 
 
 @dataclass

@@ -9,7 +9,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from mm_bot.connector.lighter.lighter_exchange import LighterConnector
+from mm_bot.connector.lighter import LighterConnector
 
 
 async def main():
@@ -100,4 +100,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-

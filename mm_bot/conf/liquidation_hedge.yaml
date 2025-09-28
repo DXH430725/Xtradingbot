@@ -50,3 +50,4 @@ strategy:
     telemetry_interval_secs: 2.0
     telegram_keys_path: tg_key.txt
     telegram_enabled: true
+    test_mode: true
