@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 from mm_bot.execution.orders import TrackingLimitOrder, TrackingMarketOrder
 
@@ -223,22 +223,34 @@ class ExecutionLayer:
         *,
         canonical_symbol: str,
         tolerance: float = 1e-6,
+        venues: Optional[List[str]] = None,
     ) -> Dict[str, bool]:
+        targets = [v.lower() for v in (venues or self.connectors.keys())]
         size_scales: Dict[str, int] = {}
         symbols: Dict[str, str] = {}
         locks: Dict[str, asyncio.Lock] = {}
-        for venue in self.connectors:
+        filtered_connectors: Dict[str, Any] = {}
+        for venue in targets:
+            connector = self.connectors.get(venue)
+            if connector is None:
+                continue
+            mapped_symbol = self.symbols.to_venue(canonical_symbol, venue)
+            if mapped_symbol is None:
+                continue
+            filtered_connectors[venue] = connector
             size_scales[venue] = await self.ensure_scale(venue, canonical_symbol)
-            symbols[venue] = self.symbols.to_venue(canonical_symbol, venue, default=canonical_symbol)
+            symbols[venue] = mapped_symbol
             locks[venue] = await self._lock_for(venue)
+        if not filtered_connectors:
+            return {}
         return await emergency_unwind(
-            self.connectors,
+            filtered_connectors,
             symbols=symbols,
             size_scales=size_scales,
             tolerance=tolerance,
             coi_manager=self.coi_manager,
             nonce_manager=self.nonce_manager,
-            api_key_indices=self._api_keys,
+            api_key_indices={k: self._api_keys.get(k) for k in filtered_connectors},
             locks=locks,
             logger=self.log,
             notify=self._notify_emergency,

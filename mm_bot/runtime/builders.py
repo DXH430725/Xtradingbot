@@ -210,7 +210,27 @@ def build_connector_test_strategy(cfg: Dict[str, Any], connectors: Dict[str, Any
     pause_between = get_float(params_cfg, "pause_between_tests_secs", default=2.0) or 2.0
     test_mode_cfg = get_bool(params_cfg, "test_mode", default=False)
     params = ConnectorTestParams(tasks=tasks, pause_between_tests_secs=pause_between, test_mode=bool(test_mode_cfg))
+    if not connectors:
+        raise RuntimeError("connector_test requires at least one connector; verify resolve_connectors configuration")
     return ConnectorTestStrategy(connectors=connectors, params=params)
+
+
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
+
+def _resolve_connector_test_connectors(strategy_cfg: Dict[str, Any], general: Dict[str, Any]) -> List[str]:
+    params_cfg = get_dict(strategy_cfg, "connector_test") or strategy_cfg
+    tasks_cfg = params_cfg.get("tasks", [])
+    venues: List[str] = []
+    if isinstance(tasks_cfg, list):
+        for item in tasks_cfg:
+            if not isinstance(item, dict):
+                continue
+            venue = get_str(item, "venue")
+            if venue:
+                venues.append(str(venue).lower())
+    return list(dict.fromkeys(venues))
 
 
 STRATEGY_BUILDERS: Dict[str, Dict[str, Any]] = {
@@ -227,6 +247,7 @@ STRATEGY_BUILDERS: Dict[str, Dict[str, Any]] = {
     "connector_test": {
         "factory": build_connector_test_strategy,
         "requires": [],
+        "resolve_connectors": _resolve_connector_test_connectors,
         "description": "Generic connector operation test",
     },
 }

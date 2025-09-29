@@ -244,9 +244,13 @@ class BaseConnector:
         *,
         symbol: Optional[str] = None,
         is_ask: Optional[bool] = None,
+        size_i: Optional[int] = None,
     ) -> TrackingMarketOrder:
         tracker = self._track_order(client_order_id, symbol=symbol, is_ask=is_ask)
-        return TrackingMarketOrder(tracker)
+        order = TrackingMarketOrder(tracker)
+        if size_i is not None:
+            order.requested_size_i = size_i  # type: ignore[attr-defined]
+        return order
 
     def update_orders_from_events(
         self,
