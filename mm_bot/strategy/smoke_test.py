@@ -23,6 +23,7 @@ class ConnectorTestTask:
     tracking_interval_secs: float = 10.0
     tracking_timeout_secs: float = 120.0
     cancel_wait_secs: float = 2.0
+    reduce_only_probe: bool = False
 
 
 @dataclass
@@ -102,16 +103,19 @@ class ConnectorTestStrategy(StrategyBase):
             connector = self._connectors.get(venue)
             if connector is None:
                 raise ValueError(f"connector '{venue}' not supplied")
+            # Map canonical symbol to venue-specific format
+            venue_symbol = connector.map_symbol(task.symbol)
+
             if hasattr(connector, "start_ws_state"):
                 start_ws = connector.start_ws_state
                 try:
-                    result = start_ws([task.symbol])
+                    result = start_ws([venue_symbol])
                 except TypeError:
                     result = start_ws()
                 if asyncio.iscoroutine(result):
                     await result
             canonical = f"TEST:{idx}"
-            symbols_by_task[canonical] = {venue: task.symbol}
+            symbols_by_task[canonical] = {venue: venue_symbol}
             self._canonicals.append(canonical)
             self._canonical_venues[canonical] = [venue]
             self._report[idx] = {

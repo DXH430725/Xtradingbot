@@ -597,6 +597,27 @@ class BackpackRESTMixin:
         return data, data, last_err
 
     async def cancel_by_client_id(self, symbol: str, client_id: int) -> Tuple[Any, Any, Optional[str]]:
+        # Try direct cancel with clientId first (faster)
+        await self._ensure_markets()
+        payload = {"clientId": int(client_id), "symbol": symbol}
+        headers = self._auth_headers("orderCancel", payload)
+        await self._throttler.acquire("/api/v1/order/cancel")
+
+        async with self._session.post(
+            self.config.base_url + "/api/v1/order/cancel",
+            headers=headers,
+            json=payload,
+            timeout=20,
+        ) as resp:
+            try:
+                data = await resp.json()
+                if resp.status == 200:
+                    return data, None, None
+                # If clientId cancel failed, fall back to the old method
+            except Exception:
+                pass
+
+        # Fallback: get order first, then cancel by orderId
         try:
             order, err = await self.get_order(symbol, client_id=int(client_id))
         except Exception as exc:

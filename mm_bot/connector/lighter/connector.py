@@ -73,6 +73,19 @@ class LighterConnector(LighterRESTMixin, LighterWSMixin, BaseConnector):
         self._ws_state_stop: bool = False
         self._rest_reconcile_task: Optional[asyncio.Task] = None
 
+    def _init_symbol_mapping(self) -> Dict[str, str]:
+        """Initialize Lighter-specific symbol mapping."""
+        return {
+            'BTC': 'BTCPERP',
+            'ETH': 'ETHPERP',
+            'SOL': 'SOLPERP',
+            'DOGE': 'DOGEPERP',
+            'WIF': 'WIFPERP',
+            'PYTH': 'PYTHPERP',
+            'JTO': 'JTOPERP',
+            'JUP': 'JUPPERP',
+        }
+
     def start(self, core: Any | None = None) -> None:  # noqa: D401 - lifecycle hook
         if self._started:
             return

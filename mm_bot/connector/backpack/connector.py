@@ -48,6 +48,20 @@ class BackpackConnector(BackpackRESTMixin, BackpackWSMixin, BaseConnector):
         self._depth_state: Dict[str, Dict[str, Any]] = {}
         self._positions_by_symbol: Dict[str, Dict[str, Any]] = {}
 
+    def _init_symbol_mapping(self) -> Dict[str, str]:
+        """Initialize Backpack-specific symbol mapping."""
+        return {
+            'BTC': 'BTC_USDC_PERP',
+            'ETH': 'ETH_USDC_PERP',
+            'SOL': 'SOL_USDC_PERP',
+            'DOGE': 'DOGE_USDC_PERP',
+            'WIF': 'WIF_USDC_PERP',
+            'BONK': 'BONK_USDC_PERP',
+            'JTO': 'JTO_USDC_PERP',
+            'JUP': 'JUP_USDC_PERP',
+            'RNDR': 'RNDR_USDC_PERP',
+        }
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------

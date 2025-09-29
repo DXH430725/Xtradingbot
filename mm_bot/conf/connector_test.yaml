@@ -15,10 +15,11 @@ strategy:
     test_mode: true
     tasks:
       - venue: backpack
-        symbol: BTC_USDC_PERP
+        symbol: BTC
         order_type: tracking_limit
         side: buy
         price_offset_ticks: 1
         tracking_interval_secs: 10.0
         tracking_timeout_secs: 120.0
+        cancel_wait_secs: 10.0
         reduce_only_probe: true

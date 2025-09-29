@@ -62,6 +62,24 @@ class BaseConnector:
             "trade": None,
             "position": None,
         }
+        self.symbol_mapping = self._init_symbol_mapping()
+
+    def _init_symbol_mapping(self) -> Dict[str, str]:
+        """Initialize symbol mapping from canonical to venue-specific format.
+        Override in subclasses for exchange-specific mappings.
+        """
+        return {}
+
+    def map_symbol(self, canonical_symbol: str) -> str:
+        """Map canonical symbol (e.g., 'BTC') to venue-specific format.
+
+        Args:
+            canonical_symbol: Canonical symbol like 'BTC', 'ETH'
+
+        Returns:
+            Venue-specific symbol like 'BTC_USDC_PERP', 'BTC-USD-PERP'
+        """
+        return self.symbol_mapping.get(canonical_symbol, canonical_symbol)
 
     # ------------------------------------------------------------------
     # Listener management

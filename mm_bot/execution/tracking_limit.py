@@ -78,6 +78,17 @@ async def place_tracking_limit_order(
 
     max_attempts = max_attempts if (max_attempts is None or max_attempts > 0) else 1
 
+    if logger:
+        logger.info(
+            "tracking_limit starting symbol=%s base_amount_i=%s is_ask=%s interval=%.1f timeout=%.1f max_attempts=%s",
+            symbol,
+            base_amount_i,
+            is_ask,
+            interval_secs,
+            timeout_secs,
+            max_attempts
+        )
+
     while True:
         attempts += 1
         remaining = timeout_secs - (time.monotonic() - start_ts)
@@ -117,32 +128,106 @@ async def place_tracking_limit_order(
             reduce_only=reduce_only,
         )
 
+        if logger:
+            logger.info(
+                "tracking_limit submitted attempt=%s coi=%s initial_state=%s",
+                attempts,
+                client_order_index,
+                tracker.state.value
+            )
+
         wait_time = min(interval_secs, remaining)
+        wait_start_time = time.monotonic()
+        if logger:
+            logger.info(
+                "tracking_limit wait_start attempt=%s wait_time=%.1f remaining=%.1f interval=%.1f state=%s time=%.3f",
+                attempts,
+                wait_time,
+                remaining,
+                interval_secs,
+                tracker.state.value,
+                wait_start_time
+            )
+
+        wait_timeout = False
         try:
             await tracker.wait_final(timeout=wait_time if wait_time > 0 else None)
         except asyncio.TimeoutError:
-            pass
+            wait_timeout = True
+            wait_actual_time = time.monotonic() - wait_start_time
+            if logger:
+                logger.info(
+                    "tracking_limit wait_timeout attempt=%s expected=%.1f actual=%.3f state=%s",
+                    attempts,
+                    wait_time,
+                    wait_actual_time,
+                    tracker.state.value
+                )
+
+        wait_actual_time = time.monotonic() - wait_start_time
+        if logger:
+            logger.info(
+                "tracking_limit wait_complete attempt=%s timeout=%s actual_wait=%.3f state=%s",
+                attempts,
+                wait_timeout,
+                wait_actual_time,
+                tracker.state.value
+            )
 
         if tracker.state == OrderState.FILLED:
+            if logger:
+                logger.info("tracking_limit filled attempt=%s", attempts)
             return tracker
 
         if tracker.state == OrderState.FAILED:
+            if logger:
+                logger.info("tracking_limit failed attempt=%s", attempts)
             return tracker
 
         if tracker.state == OrderState.CANCELLED:
+            if logger:
+                logger.info("tracking_limit already_cancelled attempt=%s max_attempts=%s -> continue to next attempt", attempts, max_attempts)
             if max_attempts is not None and attempts >= max_attempts:
                 return tracker
             continue
+
+        # If we reach here, the order is still active and needs to be cancelled
+        if logger:
+            logger.info(
+                "tracking_limit needs_cancel attempt=%s state=%s coi=%s timeout=%s wait_time=%.1f",
+                attempts,
+                tracker.state.value,
+                client_order_index,
+                wait_timeout,
+                wait_actual_time
+            )
 
         await _cancel_order(
             connector,
             symbol=symbol,
             client_order_index=client_order_index,
             wait_secs=cancel_wait_secs,
+            logger=logger,
         )
 
+        if logger:
+            logger.info(
+                "tracking_limit cancelled_order attempt=%s wait_secs=%.1f final_state=%s",
+                attempts,
+                cancel_wait_secs,
+                tracker.state.value
+            )
+
         if max_attempts is not None and attempts >= max_attempts:
+            if logger:
+                logger.info("tracking_limit max_attempts_reached attempt=%s", attempts)
             return tracker
+
+        if logger:
+            logger.info(
+                "tracking_limit loop_end attempt=%s -> starting next attempt",
+                attempts
+            )
 
     # Should never reach, added for mypy completeness.
     return tracker  # type: ignore[return-value]
@@ -278,7 +363,16 @@ async def _cancel_order(
     symbol: str,
     client_order_index: int,
     wait_secs: float,
+    logger: Optional[Any] = None,
 ) -> None:
+    if logger:
+        logger.info(
+            "cancel_order start symbol=%s coi=%s wait_secs=%.1f",
+            symbol,
+            client_order_index,
+            wait_secs
+        )
+
     cancel_fns = (
         "cancel_by_client_id",
         "cancel_by_client_order_index",
@@ -286,6 +380,8 @@ async def _cancel_order(
     for name in cancel_fns:
         fn = getattr(connector, name, None)
         if callable(fn):
+            if logger:
+                logger.info("cancel_order using method=%s", name)
             try:
                 result = fn(symbol, client_order_index)
             except TypeError:
@@ -293,15 +389,34 @@ async def _cancel_order(
             if asyncio.iscoroutine(result):
                 try:
                     await asyncio.wait_for(result, timeout=wait_secs)
+                    if logger:
+                        logger.info("cancel_order completed method=%s", name)
                 except asyncio.TimeoutError:
+                    if logger:
+                        logger.warning("cancel_order timeout method=%s", name)
                     pass
+            else:
+                if logger:
+                    logger.info("cancel_order sync completed method=%s", name)
             return
 
     cancel_all = getattr(connector, "cancel_all", None)
     if callable(cancel_all):
+        if logger:
+            logger.info("cancel_order using cancel_all")
         result = cancel_all()
         if asyncio.iscoroutine(result):
             try:
                 await asyncio.wait_for(result, timeout=wait_secs)
+                if logger:
+                    logger.info("cancel_order cancel_all completed")
             except asyncio.TimeoutError:
+                if logger:
+                    logger.warning("cancel_order cancel_all timeout")
                 pass
+        else:
+            if logger:
+                logger.info("cancel_order cancel_all sync completed")
+    else:
+        if logger:
+            logger.warning("cancel_order no cancel methods available")
