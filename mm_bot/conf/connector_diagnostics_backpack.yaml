@@ -3,7 +3,7 @@
 
 strategy:
   name: "connector_diagnostics"
-  params:
+  connector_diagnostics:
     test_mode: true
     pause_between_tests_secs: 3.0
     tasks:

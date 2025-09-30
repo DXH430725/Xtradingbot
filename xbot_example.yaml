@@ -1,0 +1,44 @@
+# XBot example configuration file
+# Copy to xbot.yaml and customize for your needs
+
+general:
+  debug: true
+  tick_ms: 1000.0
+  log_level: "INFO"
+
+connectors:
+  # Mock connector for testing
+  mock:
+    # No configuration needed for mock connector
+
+  # Backpack exchange (uncomment and configure)
+  # backpack:
+  #   keys_file: "Backpack_key.txt"
+  #   base_url: "https://api.backpack.exchange"
+  #   rpm: 60
+
+  # Lighter exchange (uncomment and configure)
+  # lighter:
+  #   keys_file: "Lighter_key.txt"
+  #   base_url: "https://api.lighter.xyz"
+  #   rpm: 120
+  #   account_index: 0
+
+  # GRVT exchange (uncomment and configure)
+  # grvt:
+  #   # Uses environment variables for configuration
+  #   # XTB_GRVT_ENV=prod|testnet
+  #   # XTB_GRVT_KEYS_FILE=path/to/Grvt_key.txt
+
+strategy:
+  name: "smoke_test"
+  params:
+    venue: "mock"
+    symbol: "BTC"
+    mode: "tracking_limit"  # tracking_limit | limit_once | market
+    side: "buy"             # buy | sell
+    size_multiplier: 1.0
+    price_offset_ticks: 2
+    interval_secs: 10.0
+    timeout_secs: 120.0
+    max_attempts: 3

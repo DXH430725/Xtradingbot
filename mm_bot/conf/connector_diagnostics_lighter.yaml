@@ -1,0 +1,67 @@
+# Lighter connector diagnostics configuration
+# Enhanced smoke test with observability and timeline tracking
+
+strategy:
+  name: "connector_diagnostics"
+  connector_diagnostics:
+    test_mode: true
+    pause_between_tests_secs: 3.0
+    tasks:
+      # Test limit_once mode - single limit order placement and cancellation
+      - venue: "lighter"
+        symbol: "BTC"
+        mode: "limit_once"
+        side: "buy"
+        min_multiplier: 1.0
+        price_offset_ticks: 5  # Place 5 ticks away from best
+        tracking_timeout_secs: 30.0
+        cancel_wait_secs: 10.0  # Lighter typically faster than Backpack
+
+      # Test tracking_limit mode - continuous limit order tracking
+      - venue: "lighter"
+        symbol: "BTC"
+        mode: "tracking_limit"
+        side: "buy"
+        min_multiplier: 1.0
+        price_offset_ticks: 3
+        tracking_interval_secs: 10.0
+        tracking_timeout_secs: 60.0
+        cancel_wait_secs: 10.0
+        reduce_only_probe: true  # Test reduce-only functionality
+
+      # Test market mode - market order roundtrip
+      - venue: "lighter"
+        symbol: "BTC"
+        mode: "market"
+        side: "buy"
+        min_multiplier: 1.0
+
+      # Test ETH as well (Lighter supports multiple assets)
+      - venue: "lighter"
+        symbol: "ETH"
+        mode: "tracking_limit"
+        side: "sell"
+        min_multiplier: 1.0
+        price_offset_ticks: 2
+        tracking_interval_secs: 15.0
+        tracking_timeout_secs: 45.0
+        cancel_wait_secs: 8.0
+
+connectors:
+  lighter:
+    keys_file: "Lighter_key.txt"
+    base_url: "https://api.lighter.xyz"
+    rpm: 120  # Lighter typically allows higher rate limits
+    account_index: 0  # Lighter-specific: account index for multi-account support
+
+general:
+  debug: true
+  log_level: "DEBUG"
+
+# Output generates enhanced reports with:
+# - Price timeline tracking
+# - Order state transition analysis
+# - Race condition detection
+# - Arbitrage window timing analysis
+# - Timeline summaries with engine_ts/cancel_ack_ts/ws_seq
+# - Lighter-specific: account index validation, multi-asset testing

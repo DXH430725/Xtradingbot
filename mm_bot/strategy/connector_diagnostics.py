@@ -249,18 +249,17 @@ class ConnectorDiagnostics(StrategyBase):
             report.attempts += 1
             report.events.append(f"Placing limit order: size_i={size_i}, is_ask={is_ask}")
 
-            order = await place_tracking_limit_order(
-                connector,
-                symbol=venue_symbol,
+            # For limit_once, use the execution router instead of direct function call
+            order = await self.execution.limit_order(
+                venue,
+                canonical,
                 base_amount_i=size_i,
                 is_ask=is_ask,
                 interval_secs=task.tracking_interval_secs,
                 timeout_secs=30.0,  # Shorter timeout for limit_once
                 price_offset_ticks=task.price_offset_ticks,
                 cancel_wait_secs=task.cancel_wait_secs,
-                coi_manager=self.execution._order_service.coi_manager,
-                lock=await self.execution._order_service._get_lock(venue),
-                logger=self.log,
+                reduce_only=0,
             )
 
             if order and hasattr(order, '_tracker'):

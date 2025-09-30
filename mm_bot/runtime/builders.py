@@ -215,12 +215,61 @@ def build_connector_test_strategy(cfg: Dict[str, Any], connectors: Dict[str, Any
     return ConnectorTestStrategy(connectors=connectors, params=params)
 
 
+def build_connector_diagnostics_strategy(cfg: Dict[str, Any], connectors: Dict[str, Any], general: Dict[str, Any]) -> Any:
+    from mm_bot.strategy.connector_diagnostics import ConnectorDiagnostics, DiagnosticParams, DiagnosticTask
+
+    # The cfg comes from get_dict(strategy_section, "connector_diagnostics")
+    # So it should contain the strategy parameters directly
+    params_cfg = cfg
+
+    tasks_cfg = params_cfg.get("tasks", [])
+    tasks: List[DiagnosticTask] = []
+    default_symbol = get_str(general, "symbol", env="XTB_SYMBOL", default="BTC")
+
+    if isinstance(tasks_cfg, list):
+        for item in tasks_cfg:
+            if not isinstance(item, dict):
+                continue
+            venue = get_str(item, "venue")
+            symbol = get_str(item, "symbol", default=default_symbol)
+            if not venue or not symbol:
+                continue
+            tasks.append(
+                DiagnosticTask(
+                    venue=str(venue),
+                    symbol=str(symbol),
+                    mode=get_str(item, "mode", default="tracking_limit") or "tracking_limit",
+                    side=get_str(item, "side", default="buy") or "buy",
+                    min_multiplier=get_float(item, "min_multiplier", default=1.0) or 1.0,
+                    price_offset_ticks=get_int(item, "price_offset_ticks", default=0) or 0,
+                    tracking_interval_secs=get_float(item, "tracking_interval_secs", default=10.0) or 10.0,
+                    tracking_timeout_secs=get_float(item, "tracking_timeout_secs", default=120.0) or 120.0,
+                    cancel_wait_secs=get_float(item, "cancel_wait_secs", default=2.0) or 2.0,
+                    reduce_only_probe=get_bool(item, "reduce_only_probe", default=False),
+                )
+            )
+
+    pause_between = get_float(params_cfg, "pause_between_tests_secs", default=2.0) or 2.0
+    test_mode_cfg = get_bool(params_cfg, "test_mode", default=False)
+    params = DiagnosticParams(
+        tasks=tasks,
+        pause_between_tests_secs=pause_between,
+        test_mode=bool(test_mode_cfg)
+    )
+
+    if not connectors:
+        raise RuntimeError(f"connector_diagnostics requires at least one connector, but got: {list(connectors.keys())}")
+    return ConnectorDiagnostics(connectors=connectors, params=params)
+
+
 # ---------------------------------------------------------------------------
 # Helper functions
 # ---------------------------------------------------------------------------
 
 def _resolve_connector_test_connectors(strategy_cfg: Dict[str, Any], general: Dict[str, Any]) -> List[str]:
     params_cfg = get_dict(strategy_cfg, "connector_test") or strategy_cfg
+    if not isinstance(params_cfg, dict):
+        return []
     tasks_cfg = params_cfg.get("tasks", [])
     venues: List[str] = []
     if isinstance(tasks_cfg, list):
@@ -230,6 +279,26 @@ def _resolve_connector_test_connectors(strategy_cfg: Dict[str, Any], general: Di
             venue = get_str(item, "venue")
             if venue:
                 venues.append(str(venue).lower())
+    return list(dict.fromkeys(venues))
+
+
+def _resolve_connector_diagnostics_connectors(strategy_cfg: Dict[str, Any], general: Dict[str, Any]) -> List[str]:
+    # The strategy_cfg comes from get_dict(strategy_section, "connector_diagnostics")
+    # So it should contain the strategy parameters directly
+    if not isinstance(strategy_cfg, dict):
+        return []
+
+    tasks_cfg = strategy_cfg.get("tasks", [])
+    venues: List[str] = []
+
+    if isinstance(tasks_cfg, list):
+        for item in tasks_cfg:
+            if not isinstance(item, dict):
+                continue
+            venue = get_str(item, "venue")
+            if venue:
+                venues.append(str(venue).lower())
+
     return list(dict.fromkeys(venues))
 
 
@@ -249,6 +318,12 @@ STRATEGY_BUILDERS: Dict[str, Dict[str, Any]] = {
         "requires": [],
         "resolve_connectors": _resolve_connector_test_connectors,
         "description": "Generic connector operation test",
+    },
+    "connector_diagnostics": {
+        "factory": build_connector_diagnostics_strategy,
+        "requires": [],
+        "resolve_connectors": _resolve_connector_diagnostics_connectors,
+        "description": "Enhanced connector diagnostics with observability",
     },
 }
 
