@@ -22,10 +22,15 @@ class GeneralConfig:
 @dataclass
 class ConnectorConfig:
     """Configuration for a single connector."""
+    venue_name: str = ""
+    connector_type: str = ""  # backpack, lighter, grvt, mock
     keys_file: Optional[str] = None
     base_url: Optional[str] = None
+    ws_url: Optional[str] = None
+    broker_id: Optional[int] = None
     rpm: Optional[int] = None
     account_index: Optional[int] = None
+    debug: bool = False
 
     # Add other common connector parameters as needed
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -89,13 +94,19 @@ class SystemConfig:
         connectors = {}
         connectors_data = data.get('connectors', {})
         for name, conn_data in connectors_data.items():
+            known_fields = ['venue_name', 'connector_type', 'keys_file', 'base_url',
+                          'ws_url', 'broker_id', 'rpm', 'account_index', 'debug']
             connector = ConnectorConfig(
+                venue_name=conn_data.get('venue_name', name),
+                connector_type=conn_data.get('connector_type', name),
                 keys_file=conn_data.get('keys_file'),
                 base_url=conn_data.get('base_url'),
+                ws_url=conn_data.get('ws_url'),
+                broker_id=conn_data.get('broker_id'),
                 rpm=conn_data.get('rpm'),
                 account_index=conn_data.get('account_index'),
-                extra={k: v for k, v in conn_data.items()
-                      if k not in ['keys_file', 'base_url', 'rpm', 'account_index']}
+                debug=conn_data.get('debug', general.debug),
+                extra={k: v for k, v in conn_data.items() if k not in known_fields}
             )
             connectors[name] = connector
 
@@ -128,10 +139,15 @@ class SystemConfig:
             },
             'connectors': {
                 name: {
+                    'venue_name': conn.venue_name,
+                    'connector_type': conn.connector_type,
                     'keys_file': conn.keys_file,
                     'base_url': conn.base_url,
+                    'ws_url': conn.ws_url,
+                    'broker_id': conn.broker_id,
                     'rpm': conn.rpm,
                     'account_index': conn.account_index,
+                    'debug': conn.debug,
                     **conn.extra
                 }
                 for name, conn in self.connectors.items()

@@ -120,8 +120,8 @@ Examples:
     parser.add_argument(
         '--max-attempts',
         type=int,
-        default=3,
-        help='Maximum attempts (default: 3)'
+        default=None,
+        help='Maximum attempts (default: None for infinite)'
     )
 
     # Connector settings
@@ -186,7 +186,13 @@ def create_connector(venue: str, config: SystemConfig) -> Optional[any]:
         )
         return MockConnector(mock_config, debug=config.general.debug)
 
-    # TODO: Add real connector implementations
+    if venue_key == "backpack":
+        from ..connector.backpack import BackpackConnector
+        if not connector_config:
+            raise ValueError("Backpack connector requires configuration")
+        return BackpackConnector(connector_config)
+
+    # TODO: Add lighter, grvt connector implementations
     # elif venue_key == "backpack":
     #     return create_backpack_connector(connector_config)
     # elif venue_key == "lighter":

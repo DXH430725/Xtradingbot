@@ -1,0 +1,27 @@
+# Backpack Real Trading Smoke Test Configuration
+# Tests minimum order size on real exchange
+
+general:
+  debug: false
+  log_level: INFO
+
+connectors:
+  backpack:
+    connector_type: backpack
+    base_url: https://api.backpack.exchange
+    ws_url: wss://ws.backpack.exchange
+    keys_file: Backpack_key.txt
+    broker_id: 1500
+
+strategy:
+  name: smoke_test
+  params:
+    venue: backpack
+    symbol: SOL  # SOL_USDC_PERP - smaller minimum size than BTC
+    mode: tracking_limit  # tracking_limit | limit_once | market
+    side: buy
+    size_multiplier: 1.0  # 1x minimum size
+    timeout_secs: 10.0
+    interval_secs: 10.0
+    price_offset_ticks: -2  # 2 ticks better than best bid for buy
+    max_attempts: null  # Infinite retry until timeout

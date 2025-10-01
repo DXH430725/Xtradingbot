@@ -1,0 +1,27 @@
+# Backpack Partial Fill Test
+# Test partial fill detection with larger order size
+
+general:
+  debug: false
+  log_level: INFO
+
+connectors:
+  backpack:
+    connector_type: backpack
+    base_url: https://api.backpack.exchange
+    ws_url: wss://ws.backpack.exchange
+    keys_file: Backpack_key.txt
+    broker_id: 1500
+
+strategy:
+  name: smoke_test
+  params:
+    venue: backpack
+    symbol: SOL
+    mode: tracking_limit
+    side: buy
+    size_multiplier: 5.0  # 5x minimum size to potentially get partial fills
+    timeout_secs: 20.0
+    interval_secs: 5.0
+    price_offset_ticks: -1  # Slightly aggressive but not instant fill
+    max_attempts: 2

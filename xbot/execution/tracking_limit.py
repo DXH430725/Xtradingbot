@@ -150,7 +150,8 @@ async def place_tracking_limit_order(
             bid_i, ask_i, scale = await _get_top_of_book(connector, symbol, price_scale)
 
             # Adjust price based on book and offset
-            if price_offset_ticks > 0:
+            if price_i == 0 or price_offset_ticks != 0:
+                # Use top of book with offset if price not specified or offset given
                 adjusted_price_i = _select_price(bid_i, ask_i, scale, price_offset_ticks, is_ask)
             else:
                 adjusted_price_i = price_i
@@ -161,10 +162,25 @@ async def place_tracking_limit_order(
                     f"adjusted_price_i={adjusted_price_i}"
                 )
 
+            # Validate price - must be positive
+            if adjusted_price_i <= 0:
+                if logger:
+                    logger.error(
+                        f"Invalid price calculated: adjusted_price_i={adjusted_price_i}, "
+                        f"bid_i={bid_i}, ask_i={ask_i}, offset={price_offset_ticks}, is_ask={is_ask}"
+                    )
+                order.update_state(OrderState.FAILED, "invalid_price")
+                raise RuntimeError(f"Calculated invalid price: {adjusted_price_i}")
+
+        except RuntimeError:
+            raise  # Re-raise validation errors
         except Exception as e:
             if logger:
                 logger.error(f"Failed to get top of book: {e}")
             adjusted_price_i = price_i
+            if adjusted_price_i <= 0:
+                order.update_state(OrderState.FAILED, "invalid_price_fallback")
+                raise RuntimeError("Price is zero and top of book unavailable")
 
         # Submit order
         try:
@@ -235,12 +251,14 @@ async def place_tracking_limit_order(
                 if logger:
                     logger.error(f"Cancel failed: {e}")
 
-        # Check attempt limits
-        if max_attempts and attempts >= max_attempts:
+        # Check attempt limits (only if explicitly set)
+        if max_attempts is not None and attempts >= max_attempts:
             order.update_state(OrderState.FAILED, "max_attempts")
             if logger:
                 logger.info(f"Max attempts ({max_attempts}) reached")
             return result
+
+        # Default: infinite retry until timeout
 
         # Update COI for next attempt
         if coi_provider:
@@ -310,26 +328,29 @@ def _select_price(
     offset_ticks: int,
     is_ask: bool,
 ) -> int:
-    """Select appropriate price based on top of book and offset."""
-    offset = max(offset_ticks, 0)
+    """Select appropriate price based on top of book and offset.
+
+    Negative offset = more aggressive (closer to or across the spread)
+    Positive offset = more passive (further from best price)
+    """
     fallback = max(int(25_000 * scale), 1)
 
     if is_ask:
-        # For sells, start from ask or bid
-        base = ask_i if ask_i is not None else bid_i
-        if base is None:
-            return fallback
-        price = base + offset
+        # For sells, start from ask
+        base = ask_i if ask_i is not None else (bid_i if bid_i is not None else fallback)
+        # Negative offset = lower price (more aggressive)
+        # Positive offset = higher price (more passive)
+        price = base + offset_ticks
         # Ensure we're above the bid
         if bid_i is not None:
             price = max(price, bid_i + 1)
         return max(price, 1)
     else:
-        # For buys, start from bid or ask
-        base = bid_i if bid_i is not None else ask_i
-        if base is None:
-            return fallback
-        price = max(base - offset, 1)
+        # For buys, start from bid
+        base = bid_i if bid_i is not None else (ask_i if ask_i is not None else fallback)
+        # Negative offset = higher price (more aggressive, towards ask)
+        # Positive offset = lower price (more passive)
+        price = base - offset_ticks
         # Ensure we're below the ask
         if ask_i is not None:
             price = min(price, max(ask_i - 1, 1))

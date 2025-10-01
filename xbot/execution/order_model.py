@@ -25,6 +25,29 @@ class OrderState(Enum):
 
 
 @dataclass
+class Position:
+    """Position data model for tracking exchange positions."""
+    symbol: str                       # Trading symbol
+    qty: float                        # Net quantity (positive=long, negative=short, 0=flat)
+    notional: float                   # Net notional value
+    realized_pnl: float               # Realized PnL
+    unrealized_pnl: float             # Unrealized PnL
+    last_update_ts: float = field(default_factory=time.time)  # Last update timestamp
+
+    def is_long(self) -> bool:
+        """Check if position is long."""
+        return self.qty > 0
+
+    def is_short(self) -> bool:
+        """Check if position is short."""
+        return self.qty < 0
+
+    def is_flat(self) -> bool:
+        """Check if position is flat (no position)."""
+        return abs(self.qty) < 1e-8
+
+
+@dataclass
 class OrderEvent:
     """Single order event with timeline tracking."""
     ts: float                          # Timestamp

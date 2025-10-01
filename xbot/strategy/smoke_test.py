@@ -29,14 +29,17 @@ class SmokeTestConfig:
     """Configuration for smoke test strategy."""
     venue: str
     symbol: str
-    mode: str = "tracking_limit"  # "tracking_limit" | "limit_once" | "market"
+    mode: str = "tracking_limit"  # "tracking_limit" | "limit_once" | "market" | "full_cycle"
     side: str = "buy"  # "buy" | "sell"
     size_multiplier: float = 1.0  # Multiplier for min size
     price_offset_ticks: int = 2  # Offset from top of book
     interval_secs: float = 10.0  # Tracking interval
     timeout_secs: float = 120.0  # Total timeout
-    max_attempts: int = 3  # Maximum attempts
+    max_attempts: Optional[int] = None  # Maximum attempts (None = infinite)
     debug: bool = True
+    # Full cycle settings
+    wait_fill_timeout: float = 30.0  # Max wait for fill in full_cycle mode
+    check_position_after: bool = True  # Check zero position after close
 
 
 @dataclass
@@ -114,6 +117,8 @@ class SmokeTestStrategy:
                 await self._test_limit_once()
             elif self.config.mode == "market":
                 await self._test_market()
+            elif self.config.mode == "full_cycle":
+                await self._test_full_cycle()
             else:
                 raise ValueError(f"Unknown test mode: {self.config.mode}")
 
@@ -361,6 +366,110 @@ class SmokeTestStrategy:
                          f"duration={timeline['duration_secs']:.3f}s")
 
         self.log.info("=== END SMOKE TEST ===")
+
+    async def _test_full_cycle(self) -> None:
+        """Full cycle test: tracking limit open → wait fill → market close → check zero position."""
+        self.result.events.append(f"Starting full cycle test: {self.config.venue}:{self.config.symbol}")
+
+        connector = self.router.get_connector(self.config.venue)
+
+        # Step 1: Get symbol metadata
+        try:
+            price_dec, size_dec = await connector.get_price_size_decimals(self.config.symbol)
+            min_size_i = await self.router.min_size_i(self.config.venue, self.config.symbol)
+            size_scale = 10 ** size_dec
+            self.result.events.append(f"Symbol metadata: size_scale={size_dec}, min_size_i={min_size_i}")
+        except Exception as e:
+            self.result.warnings.append(f"Failed to get symbol metadata: {e}")
+            size_scale = 1000000
+            min_size_i = 1000
+
+        # Calculate order size
+        size_i = max(int(min_size_i * self.config.size_multiplier), 1)
+        self.result.events.append(f"Calculated size_i={size_i}")
+
+        # Step 2: Tracking limit order to open position
+        self.log.info("Step 1: Opening position with tracking limit order...")
+        try:
+            tracking_result = await place_tracking_limit_order(
+                connector=connector,
+                symbol=self.config.symbol,
+                size_i=size_i,
+                price_i=0,  # Use market price
+                is_ask=self.config.side == "sell",
+                interval_secs=self.config.interval_secs,
+                timeout_secs=self.config.wait_fill_timeout,
+                price_offset_ticks=self.config.price_offset_ticks,
+                max_attempts=None,  # Retry until timeout
+                logger=self.log
+            )
+
+            # Wait for fill
+            self.log.info("Step 2: Waiting for fill...")
+            final_state = await tracking_result.order.wait_final(timeout=self.config.wait_fill_timeout)
+
+            if final_state != OrderState.FILLED:
+                raise RuntimeError(f"Order not filled: {final_state.value}")
+
+            self.result.events.append(f"Position opened: {tracking_result.filled_base_i}/{size_i}")
+            self.result.order_count += 1
+
+        except TrackingLimitTimeoutError:
+            raise RuntimeError("Failed to open position: timeout")
+        except Exception as e:
+            raise RuntimeError(f"Failed to open position: {e}")
+
+        # Step 3: Market order to close position (reduce only)
+        self.log.info("Step 3: Closing position with market order...")
+        try:
+            close_order = await self.router.market_order(
+                venue=self.config.venue,
+                symbol=self.config.symbol,
+                size_i=size_i,
+                is_ask=not (self.config.side == "sell"),  # Opposite side
+                reduce_only=1
+            )
+
+            # Wait briefly for market order to fill
+            await asyncio.sleep(1.0)
+
+            self.result.events.append("Position closed with market order")
+            self.result.order_count += 1
+
+        except Exception as e:
+            raise RuntimeError(f"Failed to close position: {e}")
+
+        # Step 4: Check position is zero
+        if self.config.check_position_after:
+            self.log.info("Step 4: Verifying zero position...")
+            await asyncio.sleep(2.0)  # Wait for position update
+
+            try:
+                positions = await connector.get_positions()
+                symbol_pos = None
+
+                for pos in positions:
+                    pos_symbol = pos.get("symbol", "")
+                    # Map canonical symbol to exchange format for comparison
+                    if pos_symbol == connector.map_symbol(self.config.symbol):
+                        symbol_pos = pos
+                        break
+
+                if symbol_pos:
+                    pos_qty = float(symbol_pos.get("position", 0))
+                    if abs(pos_qty) > 0.0001:  # Allow tiny rounding error
+                        self.result.warnings.append(
+                            f"Position not zero after close: {pos_qty}"
+                        )
+                    else:
+                        self.result.events.append("Position verified: zero")
+                else:
+                    self.result.events.append("Position verified: not found (assumed zero)")
+
+            except Exception as e:
+                self.result.warnings.append(f"Failed to verify position: {e}")
+
+        self.log.info("Full cycle test completed successfully")
 
     @property
     def overall_success(self) -> bool:
