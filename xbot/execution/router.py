@@ -1,127 +1,61 @@
-"""Thin execution router dispatching to specialized services.
-
-The router eliminates all state caching and persistence,
-delegating to focused services that manage their own state.
-Designed to stay < 200 lines as per architecture constraints.
-"""
-
 from __future__ import annotations
 
-import logging
-from typing import Any, Dict, Optional, List
+from typing import Optional
 
-from .services.market_data_service import MarketDataService
-from .services.order_service import OrderService
-from .services.risk_service import RiskService
+from .order_service import OrderService
+from .position_service import PositionService
+from .risk_service import RiskService
+from .tracking_limit import TrackingLimitOrder
+from .models import Order
+from .market_data_service import MarketDataService
 
 
 class ExecutionRouter:
-    """Thin router dispatching execution requests to specialized services.
+    """Thin facade exposing venue execution services to strategies."""
 
-    No state caching, no persistent dictionaries - just routing and aggregation.
-    """
-
-    def __init__(self, *, logger: Optional[logging.Logger] = None) -> None:
-        self.log = logger or logging.getLogger("xbot.execution.router")
-
-        # Initialize services
-        self.services = {
-            'market': MarketDataService(logger=self.log),
-            'order': OrderService(logger=self.log),
-            'risk': RiskService(logger=self.log)
-        }
-
-        # Connector registry (no state caching)
-        self._connectors: Dict[str, Any] = {}
-
-    def register_connector(
+    def __init__(
         self,
-        venue: str,
-        connector: Any,
         *,
-        coi_limit: Optional[int] = None,
-        api_key_index: Optional[int] = None,
+        order_service: OrderService,
+        position_service: PositionService,
+        risk_service: RiskService,
+        market_data: MarketDataService,
     ) -> None:
-        """Register connector with all services."""
-        key = venue.lower()
-        self._connectors[key] = connector
+        self._orders = order_service
+        self._positions = position_service
+        self._risk = risk_service
+        self._market_data = market_data
 
-        # Register with all services
-        for service in self.services.values():
-            if hasattr(service, 'register_connector'):
-                service.register_connector(key, connector,
-                                         coi_limit=coi_limit,
-                                         api_key_index=api_key_index)
+    @property
+    def risk(self) -> RiskService:
+        return self._risk
 
-    def register_symbol(self, canonical: str, **venues: str) -> None:
-        """Register symbol mapping."""
-        self.services['market'].register_symbol(canonical, **venues)
+    @property
+    def positions(self) -> PositionService:
+        return self._positions
 
-    # Delegated methods - thin routing only
-    async def limit_order(
-        self,
-        venue: str,
-        symbol: str,
-        *,
-        size_i: int,
-        price_i: int,
-        is_ask: bool,
-        tracking: bool = False,
-        **kwargs
-    ) -> Any:
-        """Route limit order request to order service."""
-        return await self.services['order'].limit_order(
-            venue=venue,
-            symbol=symbol,
-            size_i=size_i,
-            price_i=price_i,
-            is_ask=is_ask,
-            tracking=tracking,
-            **kwargs
-        )
+    @property
+    def orders(self) -> OrderService:
+        return self._orders
 
-    async def market_order(
-        self,
-        venue: str,
-        symbol: str,
-        *,
-        size_i: int,
-        is_ask: bool,
-        **kwargs
-    ) -> Any:
-        """Route market order request to order service."""
-        return await self.services['order'].market_order(
-            venue=venue,
-            symbol=symbol,
-            size_i=size_i,
-            is_ask=is_ask,
-            **kwargs
-        )
+    @property
+    def market_data(self) -> MarketDataService:
+        return self._market_data
 
-    async def cancel(self, venue: str, symbol: str, coi: int) -> None:
-        """Route cancel request to order service."""
-        return await self.services['order'].cancel(venue, symbol, coi)
+    async def submit_limit(self, **kwargs) -> Order:
+        return await self._orders.submit_limit(**kwargs)
 
-    async def position(self, venue: Optional[str] = None) -> Any:
-        """Route position query to position service."""
-        return await self.services['market'].get_positions(venue)
+    async def submit_market(self, **kwargs) -> Order:
+        return await self._orders.submit_market(**kwargs)
 
-    async def collateral(self, venue: str) -> float:
-        """Route collateral query to position service."""
-        return await self.services['market'].get_collateral(venue)
+    async def cancel(self, symbol: str, client_order_index: int) -> None:
+        await self._orders.cancel(symbol, client_order_index)
 
-    async def size_scale(self, venue: str, canonical_symbol: str) -> int:
-        """Route size scale query to symbol service."""
-        return await self.services['market'].get_size_scale(venue, canonical_symbol)
+    async def tracking_limit(self, **kwargs) -> TrackingLimitOrder:
+        return await self._orders.place_tracking_limit(**kwargs)
 
-    async def min_size_i(self, venue: str, canonical_symbol: str) -> int:
-        """Route min size query to symbol service."""
-        return await self.services['market'].get_min_size_i(venue, canonical_symbol)
+    async def fetch_order(self, symbol: str, client_order_index: int) -> object:
+        return await self._orders.fetch_order(symbol, client_order_index)
 
-    async def check_risk(self, venue: str, symbol: str, size_i: int, **kwargs) -> bool:
-        """Route risk check to risk service."""
-        return await self.services['risk'].check_order_risk(venue, symbol, size_i, **kwargs)
 
-    def get_connector(self, venue: str) -> Any:
-        """Get connector for venue."""
-        return self._connectors.get(venue.lower())
+__all__ = ["ExecutionRouter"]

@@ -1,43 +1,51 @@
-Project: XTradingBot – Unified Connector Diagnostics & Strategy Sandbox
+Project: XTradingBot – Thin Router Architecture & Tracking Diagnostics
 
 ## Current Scope
-- Maintain a lightweight, exchange-agnostic trading core without Hummingbot dependencies.
-- Provide reusable execution helpers (tracking limit, order tracking) that production strategies and diagnostics can share.
-- Keep strategy implementations event-driven, explicitly lifecycle-managed, and straightforward to test.
+- Maintain the redesigned 18-file production footprint: thin `ExecutionRouter`, 3 execution services, unified order model, and a single tracking-limit implementation.
+- Keep connectors exchange-specific but aligned to `xbot.connector.interface.IConnector`; Backpack is live, Mock is the reference harness, Lighter/GRVT are pending stubs.
+- Provide smoke-test coverage through the new strategy pipeline (Strategy → Router → Services → Connector) and ensure architecture guardrails (`validate_system.py`) keep LOC/file limits intact.
 
 ## Implemented Components
-- **Core (`mm_bot/core/trading_core.py`)**: Async lifecycle wrapper with stop/shutdown semantics and a `wait_until_stopped()` signal consumed by the runner.
-- **Runner (`mm_bot/bin/runner.py`)**: Unified CLI that resolves connectors/strategies via the registry, prepares websocket state, and exits non-zero when strategies report failure.
-- **Execution Layer (`mm_bot/execution/`)**:
-  - `orders.py`: `OrderTracker`, `TrackingLimitOrder`, `TrackingMarketOrder`.
-  - `tracking_limit.py`: `place_tracking_limit_order()` helper + `TrackingLimitTimeoutError` for top-of-book chasing.
-- **Connectors**: Backpack, Lighter, and GRVT adapters unified under `BaseConnector`, each exposing `get_market_info`, `get_price_size_decimals`, and REST/WS reconciliation helpers.
-- **Diagnostics**: `ConnectorSmokeTestStrategy` issues tracking-limit diagnostics, verifies REST vs WS state, flattens fills with reduce-only market orders, and asserts the order-state machine is consistent.
-- **Configs**: `mm_bot/conf/smoke_test*.yaml` provide per-connector tracking parameters (interval, timeout, cancel wait, price offsets).
+- **Execution Core (`xbot/execution/`)**
+  - `router.py`: Stateless dispatcher wiring connectors into `MarketDataService`, `OrderService`, and `RiskService`.
+  - `order_model.py`: Unified `Order`, `OrderEvent`, `Position`, and `OrderState` dataclasses with async final-state waiting and timeline analytics.
+  - `services/market_data_service.py`: Combines symbol mapping, metadata caching, collateral/position aggregation.
+  - `services/order_service.py`: Central order placement/cancel/reconcile logic; `tracking` path forces the sole implementation in `tracking_limit.py`.
+  - `tracking_limit.py`: Only tracking-limit helper; re-posts at top-of-book, leverages `Order` model, handles cancel/retry/timeout.
+- **Core Orchestrator (`xbot/core/trading_core.py`)**: Boots connectors, registers strategy tick handler (`SimpleClock`), exposes `add_connector`, `register_symbol`, graceful stop/shutdown, and bulk cancel helper.
+- **Connectors (`xbot/connector/`)**
+  - `interface.py`: Protocol + typed error hierarchy used by every connector.
+  - `mock_connector.py`: Auto-fill simulation implementing `IConnector` (latency/error knobs) for CI and demos.
+  - `backpack.py`: Production connector with Ed25519 signing, REST/WS mix, live position cache (handles `account.positionUpdate`, `orderFill`), and Partial/Filled state transitions documented in `previous.md`.
+- **Strategy Layer (`xbot/strategy/smoke_test.py`)**
+  - `SmokeTestStrategy`: Short-circuit diagnostics supporting `tracking_limit`, `limit_once`, `market`, and `full_cycle` flows; reports spreads, events, and order timelines.
+- **App & Config (`xbot/app/`)**
+  - `main.py`: Unified CLI (`python -m xbot.app.main` or `python run_xbot.py`) supporting direct CLI args or YAML configs.
+  - `config.py`: Dataclass-backed loader (`SystemConfig`, `CLIConfig`) with helpers for keyfile resolution and default config discovery.
+- **Tests & Tooling**
+  - `test_xbot.py`: Async runner for smoke-test suites (`--quick` shortcut).
+  - `validate_system.py`: Ensures architecture limits (file count, LOC caps, required modules) stay green.
 
 ## Essential Commands
-- Run full multi-connector smoke test:
-  - `python mm_bot/bin/runner.py --config mm_bot/conf/smoke_test.yaml`
-- Run per-connector diagnostics:
-  - Backpack: `python mm_bot/bin/runner.py --config mm_bot/conf/smoke_test_backpack.yaml`
-  - Lighter: `python mm_bot/bin/runner.py --config mm_bot/conf/smoke_test_lighter.yaml`
-  - GRVT: `python mm_bot/bin/runner.py --config mm_bot/conf/smoke_test_grvt.yaml`
+- Direct CLI smoke test (mock): `python run_xbot.py --venue mock --symbol BTC --mode tracking_limit --side buy`
+- YAML-config launch: `python run_xbot.py --config xbot.yaml`
+- Quick regression: `python test_xbot.py --quick`
+- Full smoke battery: `python test_xbot.py`
+- Architecture lint: `python validate_system.py`
 
-## Daily Closeout Procedure
-Whenever you finish the day’s tasks:
-1. Refresh `ARCHITECTURE.md` and `DETAIL_ARCHITECTURE.md` with any structural/code changes made during the session.
-2. Stage and push updates using the cached GitHub credentials:
+## Daily Closeout Checklist
+1. Refresh architecture docs (`ARCHITECTURE.md`, `DETAIL_ARCHITECTURE.md`) to mirror structural updates.
+2. Stage and push via cached credentials:
    ```bash
    git add ARCHITECTURE.md DETAIL_ARCHITECTURE.md <other touched files>
    git commit -m "update architecture docs"
    git push
    ```
-3. Leave a short summary in the hand-off note describing the changes and remaining open items.
+3. Capture a hand-off note summarising changes plus remaining TODOs (e.g., pending venue integrations, router/service gaps).
 
-## Conventions & Notes
-- Keep modules independent of Hummingbot and minimise third-party dependencies.
-- Strategies implement `start(core)`, `stop()`, `async on_tick(now_ms)`; connectors expose `start(core)`, `stop(core)`, optional async `cancel_all`.
-- Enable verbose connector logs via `general.debug: true` or `XTB_DEBUG=1`.
-- Tracking limit diagnostics assume connectors implement `get_market_info`, `get_price_size_decimals`, `submit_limit_order`/`submit_market_order`, and `get_positions`.
-- Maintain small, composable modules; prefer dependency injection to keep components testable.
-- 除非用户明确要求，严禁使用 `git update` 从本地状态回滚或覆盖仓库内容。
+## Implementation Notes
+- The router/services avoid shared caches; symbol translation must go through `MarketDataService` (or connector helpers) to keep connectors stateless.
+- Tracking-limit diagnostics rely on `connector.get_price_size_decimals/get_top_of_book`; ensure new venues implement the `IConnector` contract end-to-end.
+- Use `ExecutionRouter.register_symbol()` to map canonical symbols (`BTC`) to venue formats (`BTC_USDC_PERP`), otherwise order/meta requests will fail on real venues.
+- `BackpackConnector` already wires `account.positionUpdate` → `Position` cache and handles partial fills (`orderFill` events) as recorded in `previous.md`; maintain parity when porting other venues.
+- Keep files ASCII-only unless an external API forces otherwise; do not run `git update` or revert user changes without explicit instruction.

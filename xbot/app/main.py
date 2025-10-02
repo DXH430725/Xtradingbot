@@ -1,363 +1,129 @@
-"""Unified CLI entrypoint - supports both direct CLI and YAML modes.
-
-Target: < 300 lines.
-"""
-
 from __future__ import annotations
 
 import argparse
 import asyncio
-import logging
-import sys
-from typing import Optional
+from typing import Dict
 
-from .config import CLIConfig, SystemConfig, find_config_file, resolve_keys_file
-from ..core import TradingCore
-from ..connector import MockConnector, MockConfig
-from ..strategy import SmokeTestStrategy, SmokeTestConfig
+from connector.factory import build_connector
+from core.clock import WallClock
+from core.lifecycle import LifecycleController
+from core.heartbeat import HeartbeatService
+from execution.market_data_service import MarketDataService
+from execution.order_service import OrderService
+from execution.position_service import PositionService
+from execution.risk_service import RiskService
+from execution.tracking_limit import TrackingLimitEngine
+from execution.router import ExecutionRouter
+from strategy.base import StrategyConfig
+from strategy.market import MarketOrderStrategy
+from strategy.tracking_limit import TrackingLimitStrategy
+from utils.logging import get_logger, setup_logging
+from .config import AppConfig, load_config
 
 
-def setup_logging(level: str = "INFO", debug: bool = False) -> None:
-    """Setup logging configuration.
+STRATEGY_REGISTRY: Dict[str, str] = {
+    "market": "market",
+    "tracking_limit": "tracking_limit",
+}
 
-    Args:
-        level: Log level string
-        debug: Enable debug mode
-    """
-    log_level = getattr(logging, level.upper(), logging.INFO)
-    if debug:
-        log_level = logging.DEBUG
 
-    logging.basicConfig(
-        level=log_level,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        datefmt='%H:%M:%S'
+async def run(cfg: AppConfig, log_level: str) -> None:
+    setup_logging(log_level)
+    logger = get_logger(__name__)
+    connector = build_connector(cfg.venue)
+    market_data = MarketDataService(connector=connector, symbol_map=cfg.symbol_map)
+    position_service = PositionService()
+    risk_service = RiskService(market_data=market_data, position_service=position_service, limits=cfg.risk_limits)
+    tracking_engine = TrackingLimitEngine(
+        market_data=market_data,
+        default_interval_secs=cfg.interval_secs,
+        default_timeout_secs=cfg.timeout_secs,
     )
-
-
-def create_argument_parser() -> argparse.ArgumentParser:
-    """Create command line argument parser.
-
-    Returns:
-        Configured ArgumentParser
-    """
-    parser = argparse.ArgumentParser(
-        description="XBot - Cross-exchange arbitrage trading system",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # CLI direct mode (smoke test)
-  python -m xbot.app.main --venue lighter --symbol BTC --mode tracking_limit \\
-    --side buy --timeout 120 --debug
-
-  # YAML configuration mode
-  python -m xbot.app.main --config config.yaml
-
-  # List available modes
-  python -m xbot.app.main --help
-        """
+    order_service = OrderService(
+        connector=connector,
+        market_data=market_data,
+        risk_service=risk_service,
+        tracking_engine=tracking_engine,
     )
-
-    # Config file mode
-    parser.add_argument(
-        '--config', '-c',
-        help='Path to YAML configuration file'
+    router = ExecutionRouter(
+        order_service=order_service,
+        position_service=position_service,
+        risk_service=risk_service,
+        market_data=market_data,
     )
-
-    # CLI direct mode
-    parser.add_argument(
-        '--venue',
-        help='Exchange venue (backpack, lighter, grvt, mock)'
+    lifecycle = LifecycleController(connector=connector)
+    clock = WallClock()
+    heartbeat: HeartbeatService | None = None
+    strategy_cfg = StrategyConfig(
+        symbol=cfg.symbol,
+        mode=cfg.mode,
+        qty=cfg.qty,
+        side=cfg.side,
+        reduce_only=cfg.reduce_only,
+        price_offset_ticks=cfg.price_offset_ticks,
+        interval_secs=cfg.interval_secs,
+        timeout_secs=cfg.timeout_secs,
     )
-
-    parser.add_argument(
-        '--symbol',
-        help='Trading symbol (BTC, ETH, SOL)'
-    )
-
-    parser.add_argument(
-        '--mode',
-        choices=['tracking_limit', 'limit_once', 'market'],
-        default='tracking_limit',
-        help='Test mode (default: tracking_limit)'
-    )
-
-    parser.add_argument(
-        '--side',
-        choices=['buy', 'sell'],
-        default='buy',
-        help='Order side (default: buy)'
-    )
-
-    parser.add_argument(
-        '--size-multiplier',
-        type=float,
-        default=1.0,
-        help='Size multiplier for minimum order size (default: 1.0)'
-    )
-
-    parser.add_argument(
-        '--price-offset',
-        type=int,
-        default=2,
-        help='Price offset in ticks from top of book (default: 2)'
-    )
-
-    parser.add_argument(
-        '--interval',
-        type=float,
-        default=10.0,
-        help='Tracking interval in seconds (default: 10.0)'
-    )
-
-    parser.add_argument(
-        '--timeout',
-        type=float,
-        default=120.0,
-        help='Total timeout in seconds (default: 120.0)'
-    )
-
-    parser.add_argument(
-        '--max-attempts',
-        type=int,
-        default=None,
-        help='Maximum attempts (default: None for infinite)'
-    )
-
-    # Connector settings
-    parser.add_argument(
-        '--keys-file',
-        help='Path to keys file'
-    )
-
-    parser.add_argument(
-        '--base-url',
-        help='Base URL for exchange API'
-    )
-
-    # Global settings
-    parser.add_argument(
-        '--debug',
-        action='store_true',
-        help='Enable debug mode'
-    )
-
-    parser.add_argument(
-        '--list-venues',
-        action='store_true',
-        help='List supported venues and exit'
-    )
-
-    return parser
-
-
-def list_supported_venues() -> None:
-    """Print list of supported venues."""
-    venues = [
-        ("mock", "Mock connector for testing"),
-        ("backpack", "Backpack exchange (requires keys)"),
-        ("lighter", "Lighter exchange (requires keys)"),
-        ("grvt", "GRVT exchange (requires keys)")
-    ]
-
-    print("Supported venues:")
-    for venue, description in venues:
-        print(f"  {venue:<12} - {description}")
-
-
-def create_connector(venue: str, config: SystemConfig) -> Optional[any]:
-    """Create connector for venue.
-
-    Args:
-        venue: Venue name
-        config: System configuration
-
-    Returns:
-        Connector instance or None if unsupported
-    """
-    venue_key = venue.lower()
-    connector_config = config.connectors.get(venue_key)
-
-    if venue_key == "mock":
-        mock_config = MockConfig(
-            venue_name=venue,
-            latency_ms=50.0,
-            auto_fill_rate=0.8
-        )
-        return MockConnector(mock_config, debug=config.general.debug)
-
-    if venue_key == "backpack":
-        from ..connector.backpack import BackpackConnector
-        if not connector_config:
-            raise ValueError("Backpack connector requires configuration")
-        return BackpackConnector(connector_config)
-
-    # TODO: Add lighter, grvt connector implementations
-    # elif venue_key == "backpack":
-    #     return create_backpack_connector(connector_config)
-    # elif venue_key == "lighter":
-    #     return create_lighter_connector(connector_config)
-    # elif venue_key == "grvt":
-    #     return create_grvt_connector(connector_config)
-
-    print(f"Error: Venue '{venue}' not yet implemented")
-    return None
-
-
-async def run_with_config(config: SystemConfig) -> int:
-    """Run system with configuration.
-
-    Args:
-        config: System configuration
-
-    Returns:
-        Exit code (0 for success)
-    """
-    # Setup logging
-    setup_logging(config.general.log_level, config.general.debug)
-    log = logging.getLogger("xbot.app.main")
-
-    if not config.strategy:
-        log.error("No strategy configured")
-        return 1
-
-    # Create trading core
-    core = TradingCore(
-        tick_interval_ms=config.general.tick_ms,
-        debug=config.general.debug
-    )
-
-    # Create and add connectors
-    for venue_name in config.connectors.keys():
-        connector = create_connector(venue_name, config)
-        if not connector:
-            log.error(f"Failed to create connector for {venue_name}")
-            return 1
-
-        core.add_connector(venue_name, connector)
-        log.info(f"Added connector: {venue_name}")
-
-    # Create strategy
-    if config.strategy.name == "smoke_test":
-        smoke_config = SmokeTestConfig(
-            venue=config.strategy.params["venue"],
-            symbol=config.strategy.params["symbol"],
-            mode=config.strategy.params.get("mode", "tracking_limit"),
-            side=config.strategy.params.get("side", "buy"),
-            size_multiplier=config.strategy.params.get("size_multiplier", 1.0),
-            price_offset_ticks=config.strategy.params.get("price_offset_ticks", 2),
-            interval_secs=config.strategy.params.get("interval_secs", 10.0),
-            timeout_secs=config.strategy.params.get("timeout_secs", 120.0),
-            max_attempts=config.strategy.params.get("max_attempts", 3),
-            debug=config.general.debug
-        )
-
-        strategy = SmokeTestStrategy(smoke_config, core.router)
-        core.set_strategy(strategy)
-        log.info("Created smoke test strategy")
-
+    if cfg.mode == "tracking_limit":
+        strategy = TrackingLimitStrategy(router=router, clock=clock, config=strategy_cfg)
+    elif cfg.mode == "market":
+        strategy = MarketOrderStrategy(router=router, clock=clock, config=strategy_cfg)
     else:
-        log.error(f"Unknown strategy: {config.strategy.name}")
-        return 1
+        raise ValueError(f"unsupported mode: {cfg.mode}")
 
-    # Run the system
+    await lifecycle.start()
     try:
-        log.info("Starting trading system...")
-        await core.start()
-
-        log.info("System running, waiting for completion...")
-        await core.wait_until_stopped()
-
-        # Check results for smoke test
-        if hasattr(strategy, 'overall_success'):
-            if strategy.overall_success:
-                log.info("Strategy completed successfully")
-                return 0
-            else:
-                log.error(f"Strategy failed: {strategy.failure_reason}")
-                return 1
-        else:
-            log.info("Strategy completed")
-            return 0
-
-    except KeyboardInterrupt:
-        log.info("Interrupted by user")
-        return 130
-
-    except Exception as e:
-        log.error(f"System error: {e}")
-        if config.general.debug:
-            log.exception("Full error details")
-        return 1
-
+        if cfg.heartbeat_config:
+            heartbeat = HeartbeatService(
+                connector=connector,
+                router=router,
+                clock=clock,
+                strategy_name=strategy_cfg.mode,
+                venue=cfg.venue,
+                config=cfg.heartbeat_config,
+            )
+            await heartbeat.start()
+        logger.info("strategy_start", extra={"venue": cfg.venue, "mode": cfg.mode, "symbol": cfg.symbol})
+        await strategy.start()
     finally:
-        log.info("Shutting down...")
-        await core.shutdown()
+        logger.info("strategy_stop", extra={"venue": cfg.venue})
+        if heartbeat:
+            await heartbeat.stop()
+        await lifecycle.stop()
 
 
-async def main() -> int:
-    """Main entry point.
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="xbot multi-exchange strategy runner")
+    parser.add_argument("--venue", required=True, help="venue identifier, e.g. backpack")
+    parser.add_argument("--symbol", required=True, help="canonical symbol, e.g. SOL")
+    parser.add_argument("--mode", default="market", choices=sorted(STRATEGY_REGISTRY.keys()))
+    parser.add_argument("--qty", type=float, required=True, help="order quantity in base units")
+    parser.add_argument("--side", default="buy", choices=["buy", "sell"])
+    parser.add_argument("--price-offset-ticks", type=int, default=0)
+    parser.add_argument("--interval-secs", type=float, default=10.0)
+    parser.add_argument("--timeout-secs", type=float, default=120.0)
+    parser.add_argument("--reduce-only", type=int, default=0)
+    parser.add_argument("--config", dest="config_path")
+    parser.add_argument("--log-level", default="INFO")
+    return parser.parse_args()
 
-    Returns:
-        Exit code
-    """
-    parser = create_argument_parser()
-    args = parser.parse_args()
 
-    # Handle special commands
-    if args.list_venues:
-        list_supported_venues()
-        return 0
-
-    # Determine mode: YAML config or CLI direct
-    if args.config:
-        # YAML configuration mode
-        try:
-            config = SystemConfig.from_yaml(args.config)
-            print(f"Loaded configuration from: {args.config}")
-        except Exception as e:
-            print(f"Error loading config file: {e}")
-            return 1
-
-    elif args.venue and args.symbol:
-        # CLI direct mode
-        cli_config = CLIConfig(
-            venue=args.venue,
-            symbol=args.symbol,
-            mode=args.mode,
-            side=args.side,
-            size_multiplier=args.size_multiplier,
-            price_offset_ticks=args.price_offset,
-            interval_secs=args.interval,
-            timeout_secs=args.timeout,
-            max_attempts=args.max_attempts,
-            debug=args.debug,
-            keys_file=resolve_keys_file(args.venue, args.keys_file),
-            base_url=args.base_url
-        )
-
-        config = cli_config.to_system_config()
-        print(f"CLI mode: {args.venue}:{args.symbol} ({args.mode})")
-
-    else:
-        # Try to find default config file
-        config_file = find_config_file()
-        if config_file:
-            try:
-                config = SystemConfig.from_yaml(config_file)
-                print(f"Using default config: {config_file}")
-            except Exception as e:
-                print(f"Error loading default config: {e}")
-                return 1
-        else:
-            print("Error: No configuration provided")
-            print("Either specify --config <file> or --venue <venue> --symbol <symbol>")
-            print("Use --help for more information")
-            return 1
-
-    # Run the system
-    return await run_with_config(config)
+def main() -> None:
+    args = parse_args()
+    cfg = load_config(
+        venue=args.venue,
+        symbol=args.symbol,
+        qty=args.qty,
+        side=args.side,
+        mode=args.mode,
+        price_offset_ticks=args.price_offset_ticks,
+        interval_secs=args.interval_secs,
+        timeout_secs=args.timeout_secs,
+        reduce_only=args.reduce_only,
+        config_path=args.config_path,
+    )
+    asyncio.run(run(cfg, args.log_level))
 
 
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main()))
+    main()
