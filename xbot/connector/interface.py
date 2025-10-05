@@ -47,8 +47,11 @@ class IConnector(Protocol):
     ) -> str:
         """Create a market order and return the exchange-generated order id."""
 
-    async def cancel_by_client_id(self, symbol: str, client_order_index: int) -> None:
-        """Cancel an order previously created with the provided client order index."""
+    async def cancel_by_client_id(self, symbol: str, client_order_index: int) -> Dict[str, Any]:
+        """Cancel an order by client order index and return server response."""
+
+    async def cancel_by_order_id(self, symbol: str, order_id: str) -> Dict[str, Any]:
+        """Cancel an order by exchange order id and return server response."""
 
     async def get_order(self, symbol: str, client_order_index: int) -> Dict[str, Any]:
         """Return the latest order information for the provided identifiers."""

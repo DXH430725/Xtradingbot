@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, TYPE_CHECKING
+from typing import Awaitable, Callable, Dict, List, Optional, TYPE_CHECKING
 
 from xbot.connector.interface import IConnector
 
@@ -78,10 +78,11 @@ class TrackingLimitEngine:
         interval_secs: Optional[float] = None,
         timeout_secs: Optional[float] = None,
         price_offset_ticks: int = 0,
-        max_attempts: Optional[int] = None,
+        max_attempts: int = 9999,
         post_only: bool = False,
         reduce_only: int = 0,
         trace_id: Optional[str] = None,
+        observer: Optional[Callable[[str, Dict[str, object]], Awaitable[None]]] = None,
     ) -> TrackingLimitOrder:
         interval = interval_secs or self._default_interval
         timeout = timeout_secs or self._default_timeout
@@ -105,6 +106,17 @@ class TrackingLimitEngine:
             price_i = reference + price_offset_ticks if is_ask else reference - price_offset_ticks
             if price_i <= 0:
                 raise ValueError("price offset results in non-positive price")
+            if observer is not None:
+                await observer(
+                    "before_submit",
+                    {
+                        "attempt": attempt,
+                        "price_i": price_i,
+                        "remaining": remaining,
+                        "is_ask": is_ask,
+                        "symbol": symbol,
+                    },
+                )
             order = await order_service.submit_limit(
                 symbol=symbol,
                 is_ask=is_ask,
@@ -124,6 +136,17 @@ class TrackingLimitEngine:
                 except asyncio.TimeoutError:
                     update = order.snapshot()
                     update.info = {**update.info, "cancel_wait_timeout": True}
+                if observer is not None:
+                    await observer(
+                        "after_submit",
+                        {
+                            "attempt": attempt,
+                            "client_order_index": order.client_order_index,
+                            "price_i": price_i,
+                            "state": update.state.value,
+                            "info": update.info,
+                        },
+                    )
                 records.append(
                     TrackingAttempt(
                         attempt=attempt,
@@ -136,9 +159,20 @@ class TrackingLimitEngine:
                 filled = self._extract_filled(update.info)
                 cumulative_filled += filled
                 remaining = base_amount_i - cumulative_filled
-                if remaining <= max(1, int(base_amount_i * 0.0001)):
+                if cumulative_filled > 0 and remaining <= max(1, int(base_amount_i * 0.0001)):
                     return TrackingLimitOrder(order, records, cumulative_filled)
                 continue
+            if observer is not None:
+                await observer(
+                    "after_submit",
+                    {
+                        "attempt": attempt,
+                        "client_order_index": order.client_order_index,
+                        "price_i": price_i,
+                        "state": update.state.value,
+                        "info": update.info,
+                    },
+                )
             records.append(
                 TrackingAttempt(
                     attempt=attempt,
@@ -167,6 +201,8 @@ class TrackingLimitEngine:
             info.get("filled_base_i"),
             info.get("filled_size_i"),
             info.get("filled"),
+            info.get("executedQuantity"),  # REST/WS common
+            info.get("Z"),  # Backpack WS executed quantity in quote may appear; try anyway
         )
         for candidate in candidates:
             if candidate is None:

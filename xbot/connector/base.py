@@ -66,7 +66,10 @@ class BaseConnector(IConnector, abc.ABC):
     ) -> str:  # pragma: no cover - venue specific
         raise NotImplementedError
 
-    async def cancel_by_client_id(self, symbol: str, client_order_index: int) -> None:  # pragma: no cover
+    async def cancel_by_client_id(self, symbol: str, client_order_index: int) -> Dict[str, Any]:  # pragma: no cover
+        raise NotImplementedError
+
+    async def cancel_by_order_id(self, symbol: str, order_id: str) -> Dict[str, Any]:  # pragma: no cover
         raise NotImplementedError
 
     async def get_order(self, symbol: str, client_order_index: int) -> Dict[str, Any]:  # pragma: no cover

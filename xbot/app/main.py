@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 from typing import Dict
+import os
+from pathlib import Path
 
 from xbot.connector.factory import build_connector
 from xbot.core.clock import WallClock
@@ -20,6 +22,8 @@ from xbot.strategy.tracking_limit import TrackingLimitStrategy
 from xbot.strategy.diagnostic import DiagnosticStrategy
 from xbot.utils.logging import get_logger, setup_logging
 from .config import AppConfig, load_config
+from xbot.core.cache import MarketCache
+from xbot.connector.backpack_ws import BackpackWsClient
 
 
 STRATEGY_REGISTRY: Dict[str, str] = {
@@ -47,13 +51,49 @@ async def run(cfg: AppConfig, log_level: str) -> None:
         risk_service=risk_service,
         tracking_engine=tracking_engine,
     )
+    # Shared market cache and optional WS client (for Backpack)
+    cache = MarketCache()
+
     router = ExecutionRouter(
         order_service=order_service,
         position_service=position_service,
         risk_service=risk_service,
         market_data=market_data,
+        cache=cache,
     )
-    lifecycle = LifecycleController(connector=connector)
+    # Configure optional WS background task if venue supports it
+    background_tasks = []
+    if cfg.venue == "backpack":
+        try:
+            # Subscribe to the venue symbol for public streams
+            venue_symbol = market_data.resolve_symbol(cfg.symbol)
+        except Exception:
+            venue_symbol = cfg.symbol
+        key_file = Path(os.getenv("BACKPACK_KEY_FILE", str(Path.cwd() / "Backpack_key.txt")))
+        # Wire WS order updates into OrderService
+        from xbot.execution.order_service import OrderUpdatePayload
+
+        async def on_order_update(payload: OrderUpdatePayload) -> None:
+            try:
+                await order_service.ingest_update(payload)
+            except Exception:
+                # Ingest failures should not crash WS task
+                pass
+
+        ws_client = BackpackWsClient(symbols=[venue_symbol], key_file=key_file, cache=cache, on_order_update=on_order_update)
+
+        async def ws_task() -> None:
+            await ws_client.start()
+            # Keep the task alive until cancelled
+            try:
+                while True:
+                    await asyncio.sleep(3600)
+            finally:
+                await ws_client.stop()
+
+        background_tasks.append(ws_task)
+
+    lifecycle = LifecycleController(connector=connector, background_tasks=background_tasks)
     clock = WallClock()
     heartbeat: HeartbeatService | None = None
     strategy_cfg = StrategyConfig(

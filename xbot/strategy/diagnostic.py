@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from xbot.core.clock import WallClock
 from xbot.execution.router import ExecutionRouter
@@ -59,6 +59,7 @@ class DiagnosticStrategy(Strategy):
                 # Price selection: move outside spread in the intended direction
                 ref = ask_i if is_ask else bid_i
                 price_i = ref + (offset_ticks if is_ask else -offset_ticks)
+                await self._dump_ws("before_initial_limit")
                 self._logger.info(
                     "private_plan",
                     extra={
@@ -88,6 +89,7 @@ class DiagnosticStrategy(Strategy):
                         "price_i": price_i,
                     },
                 )
+                await self._dump_ws("after_initial_limit")
                 # Try fetch and then cancel (also log raw order if available)
                 await self.router.fetch_order(sym, placed_coi)
                 try:
@@ -96,15 +98,27 @@ class DiagnosticStrategy(Strategy):
                 except Exception:
                     pass
                 await self.router.cancel(sym, placed_coi)
-                self._logger.info("limit_order_cancelled", extra={"coi": placed_coi})
+                cancel_info = {}
+                try:
+                    cancel_info = order.history[-1].info if order.history else {}
+                except Exception:
+                    pass
+                self._logger.info(
+                    "limit_order_cancelled",
+                    extra={"coi": placed_coi, "cancel_response": cancel_info.get("cancel_response")},
+                )
+                await self._dump_ws("after_cancel_initial_limit")
+                # Print order state machine/history
+                hist = [e.to_dict() for e in order.history]
+                self._logger.info("order_history", extra={"coi": placed_coi, "history": hist})
         except Exception:
             # Include stacktrace for better diagnostics
             self._logger.exception("private_ops_skipped")
 
         # Account snapshots (if available)
         try:
-            positions = await self.router.positions.get_positions()
-            self._logger.info("positions_ok", extra={"count": len(positions)})
+            positions = await self.router.positions.all_positions()
+            self._logger.info("positions_ok", extra={"count": len(list(positions))})
         except Exception as exc:
             self._logger.info("positions_unavailable", extra={"error": str(exc)})
 
@@ -114,7 +128,82 @@ class DiagnosticStrategy(Strategy):
         except Exception as exc:
             self._logger.info("margin_unavailable", extra={"error": str(exc)})
 
+        # Extended diagnostic: run tracking-limit until fill, then close with market
+        try:
+            if bid_i and ask_i:
+                is_ask_open = self.config.side == "sell"
+                size_i = await self.router.market_data.to_size_i(sym, Decimal(str(self.config.qty)))
+                await self._dump_ws("before_tracking_limit")
+
+                async def observer(kind: str, ctx: Dict[str, Any]) -> None:
+                    await self._dump_ws(f"tracking_{kind}", extra=ctx)
+
+                tracking = await self.router.tracking_limit(
+                    symbol=sym,
+                    base_amount_i=size_i,
+                    is_ask=is_ask_open,
+                    price_offset_ticks=self.config.price_offset_ticks or 0,
+                    interval_secs=self.config.interval_secs,
+                    timeout_secs=self.config.timeout_secs,
+                    max_attempts=9999,
+                    observer=observer,
+                )
+                await tracking.wait_final()
+                # Log attempts/state machine
+                attempts = [
+                    {
+                        "attempt": a.attempt,
+                        "coi": a.client_order_index,
+                        "price_i": a.price_i,
+                        "state": a.state.value,
+                        "info": a.info,
+                    }
+                    for a in tracking.attempts
+                ]
+                self._logger.info(
+                    "tracking_done",
+                    extra={"attempts": attempts, "filled_base_i": tracking.filled_base_i},
+                )
+                await self._dump_ws("after_tracking_limit")
+
+                # Close with market order
+                await self._dump_ws("before_close_market")
+                close_order = await self.router.submit_market(
+                    symbol=sym,
+                    is_ask=not is_ask_open,
+                    size_i=size_i,
+                    reduce_only=1,
+                )
+                self._logger.info(
+                    "close_market_submitted",
+                    extra={
+                        "coi": close_order.client_order_index,
+                        "exchange_order_id": close_order.exchange_order_id,
+                    },
+                )
+                await self._dump_ws("after_close_market")
+                # Print close order history if any updates persisted
+                close_hist = [e.to_dict() for e in close_order.history]
+                self._logger.info("order_history", extra={"coi": close_order.client_order_index, "history": close_hist})
+        except Exception:
+            self._logger.exception("extended_diagnostic_failed")
+
         self._logger.info("diagnostic_done", extra={"symbol": sym})
+
+    async def _dump_ws(self, phase: str, *, extra: Optional[Dict[str, Any]] = None) -> None:
+        cache = self.router.cache
+        if cache is None:
+            return
+        try:
+            positions = await cache.snapshot_positions()
+            trades = await cache.snapshot_trades(self.router.market_data.resolve_symbol(self.config.symbol))
+            balances = await cache.snapshot_balances()
+            payload: Dict[str, Any] = {"phase": phase, "positions": positions, "trades": trades, "balances": balances}
+            if extra:
+                payload.update(extra)
+            self._logger.info("ws_snapshot", extra=payload)
+        except Exception:
+            self._logger.exception("ws_snapshot_error")
 
 
 __all__ = ["DiagnosticStrategy"]

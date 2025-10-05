@@ -166,13 +166,21 @@ class BackpackConnector(BaseConnector):
             return str(resp["id"])
         raise RuntimeError(f"market order failed: {resp}")
 
-    async def cancel_by_client_id(self, symbol: str, client_order_index: int) -> None:
+    async def cancel_by_client_id(self, symbol: str, client_order_index: int) -> Dict[str, Any]:
         if not self._account:
             raise RuntimeError("account keys not configured for order cancel")
         resp = await self._account.cancel_order(symbol=symbol, client_id=client_order_index)
-        # Successful cancel returns status; treat absence of error as success
-        if isinstance(resp, dict) and resp.get("code"):
-            raise RuntimeError(f"cancel failed: {resp}")
+        if not isinstance(resp, dict):
+            return {"raw": resp}
+        return resp
+
+    async def cancel_by_order_id(self, symbol: str, order_id: str) -> Dict[str, Any]:
+        if not self._account:
+            raise RuntimeError("account keys not configured for order cancel")
+        resp = await self._account.cancel_order(symbol=symbol, order_id=order_id)
+        if not isinstance(resp, dict):
+            return {"raw": resp}
+        return resp
 
     async def get_order(self, symbol: str, client_order_index: int) -> Dict[str, Any]:
         if not self._account:

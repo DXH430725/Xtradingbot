@@ -8,6 +8,7 @@ from .risk_service import RiskService
 from .tracking_limit import TrackingLimitOrder
 from .models import Order
 from .market_data_service import MarketDataService
+from ..core.cache import MarketCache
 
 
 class ExecutionRouter:
@@ -20,11 +21,13 @@ class ExecutionRouter:
         position_service: PositionService,
         risk_service: RiskService,
         market_data: MarketDataService,
+        cache: MarketCache | None = None,
     ) -> None:
         self._orders = order_service
         self._positions = position_service
         self._risk = risk_service
         self._market_data = market_data
+        self._cache = cache
 
     @property
     def risk(self) -> RiskService:
@@ -41,6 +44,10 @@ class ExecutionRouter:
     @property
     def market_data(self) -> MarketDataService:
         return self._market_data
+
+    @property
+    def cache(self) -> MarketCache | None:
+        return self._cache
 
     async def submit_limit(self, **kwargs) -> Order:
         return await self._orders.submit_limit(**kwargs)

@@ -198,11 +198,20 @@ class OrderService:
     async def cancel(self, symbol: str, client_order_index: int) -> None:
         order = await self._get(client_order_index)
         venue_symbol = self._market_data.resolve_symbol(symbol)
-        await self._connector.cancel_by_client_id(venue_symbol, client_order_index)
+        resp: Dict[str, object]
+        if order.exchange_order_id:
+            resp = await self._connector.cancel_by_order_id(venue_symbol, order.exchange_order_id)  # type: ignore[attr-defined]
+        else:
+            resp = await self._connector.cancel_by_client_id(venue_symbol, client_order_index)
         await order.apply_update(
             OrderEvent(
                 state=OrderState.CANCELLED,
-                info={"symbol": symbol, "client_order_index": client_order_index},
+                info={
+                    "symbol": symbol,
+                    "client_order_index": client_order_index,
+                    "exchange_order_id": order.exchange_order_id,
+                    "cancel_response": resp,
+                },
             )
         )
 
@@ -241,7 +250,31 @@ class OrderService:
         state_str = (data.get("state") or data.get("status") or "").lower()
         if not state_str:
             raise ValueError("connector get_order response missing state/status")
-        state = OrderState(state_str)
+
+        # Normalize various connector/exchange-specific status strings to our enum
+        normalized_map = {
+            "new": OrderState.OPEN,
+            "accepted": OrderState.OPEN,
+            "active": OrderState.OPEN,
+            "open": OrderState.OPEN,
+            "partially_filled": OrderState.PARTIALLY_FILLED,
+            "partial": OrderState.PARTIALLY_FILLED,
+            "filled": OrderState.FILLED,
+            "done": OrderState.FILLED,
+            "closed": OrderState.FILLED,
+            "cancel": OrderState.CANCELLED,
+            "canceled": OrderState.CANCELLED,
+            "cancelled": OrderState.CANCELLED,
+            "rejected": OrderState.FAILED,
+            "failed": OrderState.FAILED,
+            "error": OrderState.FAILED,
+            "pending": OrderState.SUBMITTING,
+            "queued": OrderState.SUBMITTING,
+        }
+        state = normalized_map.get(state_str)
+        if state is None:
+            # Fallback to direct enum conversion if it already matches
+            state = OrderState(state_str)
         payload = OrderUpdatePayload(
             client_order_index=client_order_index,
             state=state,
