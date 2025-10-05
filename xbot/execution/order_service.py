@@ -6,7 +6,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Dict, Optional
 
-from connector.interface import IConnector
+from xbot.connector.interface import IConnector
 
 from .market_data_service import MarketDataService
 from .models import Order, OrderEvent, OrderState

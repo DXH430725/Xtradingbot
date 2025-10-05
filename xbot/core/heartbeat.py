@@ -7,7 +7,7 @@ from typing import Optional
 
 import httpx
 
-from connector.interface import IConnector
+from xbot.connector.interface import IConnector
 from .clock import WallClock
 from ..execution.router import ExecutionRouter
 

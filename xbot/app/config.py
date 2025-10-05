@@ -6,8 +6,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from execution.risk_service import RiskLimits
-from core.heartbeat import HeartbeatConfig
+from xbot.execution.risk_service import RiskLimits
+from xbot.core.heartbeat import HeartbeatConfig
 
 try:
     import yaml  # type: ignore

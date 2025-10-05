@@ -4,7 +4,7 @@ import asyncio
 from contextlib import AsyncExitStack
 from typing import Awaitable, Callable, List, Optional
 
-from connector.interface import IConnector
+from xbot.connector.interface import IConnector
 
 
 class LifecycleController:

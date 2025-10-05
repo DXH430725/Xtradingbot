@@ -4,26 +4,28 @@ import argparse
 import asyncio
 from typing import Dict
 
-from connector.factory import build_connector
-from core.clock import WallClock
-from core.lifecycle import LifecycleController
-from core.heartbeat import HeartbeatService
-from execution.market_data_service import MarketDataService
-from execution.order_service import OrderService
-from execution.position_service import PositionService
-from execution.risk_service import RiskService
-from execution.tracking_limit import TrackingLimitEngine
-from execution.router import ExecutionRouter
-from strategy.base import StrategyConfig
-from strategy.market import MarketOrderStrategy
-from strategy.tracking_limit import TrackingLimitStrategy
-from utils.logging import get_logger, setup_logging
+from xbot.connector.factory import build_connector
+from xbot.core.clock import WallClock
+from xbot.core.lifecycle import LifecycleController
+from xbot.core.heartbeat import HeartbeatService
+from xbot.execution.market_data_service import MarketDataService
+from xbot.execution.order_service import OrderService
+from xbot.execution.position_service import PositionService
+from xbot.execution.risk_service import RiskService
+from xbot.execution.tracking_limit import TrackingLimitEngine
+from xbot.execution.router import ExecutionRouter
+from xbot.strategy.base import StrategyConfig
+from xbot.strategy.market import MarketOrderStrategy
+from xbot.strategy.tracking_limit import TrackingLimitStrategy
+from xbot.strategy.diagnostic import DiagnosticStrategy
+from xbot.utils.logging import get_logger, setup_logging
 from .config import AppConfig, load_config
 
 
 STRATEGY_REGISTRY: Dict[str, str] = {
     "market": "market",
     "tracking_limit": "tracking_limit",
+    "diagnostic": "diagnostic",
 }
 
 
@@ -68,6 +70,8 @@ async def run(cfg: AppConfig, log_level: str) -> None:
         strategy = TrackingLimitStrategy(router=router, clock=clock, config=strategy_cfg)
     elif cfg.mode == "market":
         strategy = MarketOrderStrategy(router=router, clock=clock, config=strategy_cfg)
+    elif cfg.mode == "diagnostic":
+        strategy = DiagnosticStrategy(router=router, clock=clock, config=strategy_cfg)
     else:
         raise ValueError(f"unsupported mode: {cfg.mode}")
 

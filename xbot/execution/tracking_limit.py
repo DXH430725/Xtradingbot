@@ -5,7 +5,7 @@ import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, TYPE_CHECKING
 
-from connector.interface import IConnector
+from xbot.connector.interface import IConnector
 
 from .market_data_service import MarketDataService
 from .models import Order, OrderState

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN, getcontext
 from typing import Dict, Mapping, Optional, Tuple
 
-from connector.interface import IConnector
+from xbot.connector.interface import IConnector
 
 getcontext().prec = 28
 

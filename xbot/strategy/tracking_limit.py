@@ -3,8 +3,8 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Optional
 
-from core.clock import WallClock
-from execution.router import ExecutionRouter
+from xbot.core.clock import WallClock
+from xbot.execution.router import ExecutionRouter
 from .base import Strategy, StrategyConfig
 
 

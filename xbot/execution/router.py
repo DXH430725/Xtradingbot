@@ -57,5 +57,9 @@ class ExecutionRouter:
     async def fetch_order(self, symbol: str, client_order_index: int) -> object:
         return await self._orders.fetch_order(symbol, client_order_index)
 
+    async def fetch_margin(self) -> dict:
+        # Access underlying connector for margin snapshot when available
+        return await self._orders._connector.get_margin()  # type: ignore[attr-defined]
+
 
 __all__ = ["ExecutionRouter"]
