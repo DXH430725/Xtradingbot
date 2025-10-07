@@ -185,6 +185,21 @@ class LighterConnector(BaseConnector):
         info = self._get_market_info(symbol)
         base_amount_i = int(base_amount)
         price_i = int(price)
+        try:
+            self._logger.info(
+                "unit_check_limit",
+                extra={
+                    "market_id": info.market_id,
+                    "price_decimals": info.price_decimals,
+                    "size_decimals": info.size_decimals,
+                    "base_amount_i": base_amount_i,
+                    "price_i": price_i,
+                    "base_amount": float(Decimal(base_amount_i) / (Decimal(10) ** info.size_decimals)),
+                    "price": float(Decimal(price_i) / (Decimal(10) ** info.price_decimals)),
+                },
+            )
+        except Exception:
+            pass
         self._logger.info(
             "lighter_submit_limit",
             extra={
@@ -244,6 +259,7 @@ class LighterConnector(BaseConnector):
                 return str(order_id)
         except Exception as exc:
             self._logger.info("lighter_submit_limit_lookup_error", extra={"error": str(exc)})
+        await self._probe_visibility(info.market_id, client_order_index)
         return ""
 
     async def submit_market_order(
@@ -330,6 +346,7 @@ class LighterConnector(BaseConnector):
                 return str(order_id)
         except Exception as exc:
             self._logger.info("lighter_submit_market_lookup_error", extra={"error": str(exc)})
+        await self._probe_visibility(info.market_id, client_order_index)
         return ""
 
     async def cancel_by_client_id(self, symbol: str, client_order_index: int) -> Dict[str, Any]:
@@ -445,12 +462,23 @@ class LighterConnector(BaseConnector):
             acct_idx = self.get_account_index()
             if acct_idx is None:
                 return None
-            for _ in range(5):
+            for _ in range(10):
                 try:
                     resp = await order_api.account_active_orders(
                         account_index=acct_idx, market_id=market_id, auth=token
                     )
-                    for o in getattr(resp, "orders", []) or []:
+                    orders = getattr(resp, "orders", []) or []
+                    if orders:
+                        # log minimal shape to diagnose schema
+                        try:
+                            first = orders[0]
+                            keys = list(first.__dict__.keys()) if hasattr(first, "__dict__") else None
+                        except Exception:
+                            keys = None
+                        self._logger.info(
+                            "lighter_active_orders_probe", extra={"count": len(orders), "first_keys": keys}
+                        )
+                    for o in orders:
                         try:
                             if int(getattr(o, "client_order_index", -1)) == int(client_order_index):
                                 oi = getattr(o, "order_index", None)
@@ -459,10 +487,38 @@ class LighterConnector(BaseConnector):
                             continue
                 except Exception:
                     pass
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(0.5)
         except Exception as exc:
             self._logger.info("lighter_resolve_order_id_error", extra={"error": str(exc)})
         return None
+
+    async def _probe_visibility(self, market_id: int, client_order_index: int) -> None:
+        try:
+            import lighter  # type: ignore
+            acct_idx = self.get_account_index()
+            if acct_idx is None:
+                return
+            order_api = lighter.OrderApi(self._api_client)  # type: ignore[attr-defined]
+            deadline = int(__import__("time").time() + 600)
+            token, err = self._signer.create_auth_token_with_expiry(deadline)
+            if err is not None:
+                return
+            active = await order_api.account_active_orders(account_index=acct_idx, market_id=market_id, auth=token)
+            ai = [int(getattr(o, "client_order_index", -1)) for o in (getattr(active, "orders", []) or [])]
+            inactive = await order_api.account_inactive_orders(account_index=acct_idx, market_id=market_id, auth=token)
+            ii = [int(getattr(o, "client_order_index", -1)) for o in (getattr(inactive, "orders", []) or [])]
+            self._logger.info(
+                "lighter_visibility_probe",
+                extra={
+                    "coi": client_order_index,
+                    "in_active": client_order_index in ai,
+                    "in_inactive": client_order_index in ii,
+                    "active_count": len(ai),
+                    "inactive_count": len(ii),
+                },
+            )
+        except Exception:
+            pass
 
 
 __all__ = ["LighterConnector"]
