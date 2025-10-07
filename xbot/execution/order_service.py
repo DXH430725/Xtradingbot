@@ -234,7 +234,27 @@ class OrderService:
         )
 
     async def ingest_update(self, payload: OrderUpdatePayload) -> Order:
-        order = await self._get(payload.client_order_index)
+        # Primary: by client_order_index
+        try:
+            order = await self._get(payload.client_order_index)
+        except UnknownOrderError:
+            # Fallback: when venue ws doesn't carry client id (e.g., 0), match by exchange_order_id
+            if payload.exchange_order_id:
+                # Linear scan over small in-flight set
+                async with self._lock:
+                    candidates = [o for o in self._orders.values() if o.exchange_order_id == payload.exchange_order_id]
+                if not candidates:
+                    # As a last resort, accept match when only one open order exists
+                    async with self._lock:
+                        open_orders = [o for o in self._orders.values()]
+                    if len(open_orders) == 1:
+                        order = open_orders[0]
+                    else:
+                        raise
+                else:
+                    order = candidates[0]
+            else:
+                raise
         await order.apply_update(
             OrderEvent(
                 state=payload.state,

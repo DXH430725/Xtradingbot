@@ -35,6 +35,7 @@ class TrackingLimitStrategy(Strategy):
             price_offset_ticks=self.config.price_offset_ticks,
             interval_secs=self.config.interval_secs,
             timeout_secs=self.config.timeout_secs,
+            post_only=True,
         )
         await tracking.wait_final()
         await self.clock.sleep(self._wait_after_fill)

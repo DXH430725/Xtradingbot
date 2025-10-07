@@ -92,6 +92,59 @@ async def run(cfg: AppConfig, log_level: str) -> None:
                 await ws_client.stop()
 
         background_tasks.append(ws_task)
+    elif cfg.venue == "lighter":
+        try:
+            venue_symbol = market_data.resolve_symbol(cfg.symbol)
+        except Exception:
+            venue_symbol = cfg.symbol
+        from xbot.execution.order_service import OrderUpdatePayload
+        from xbot.connector.lighter_ws import LighterWsClient
+
+        async def on_order_update(payload: OrderUpdatePayload) -> None:
+            try:
+                await order_service.ingest_update(payload)
+            except Exception:
+                pass
+
+        async def ws_task() -> None:
+            # Compute market_index and account_index after connector.start()
+            market_index = None
+            account_index = None
+            try:
+                getter = getattr(connector, "get_market_index", None)
+                if getter is not None:
+                    market_index = getter(venue_symbol)  # type: ignore[call-arg]
+            except Exception:
+                market_index = None
+            try:
+                acct_getter = getattr(connector, "get_account_index", None)
+                if acct_getter is not None:
+                    account_index = acct_getter()  # type: ignore[call-arg]
+            except Exception:
+                account_index = None
+            if market_index is None:
+                # Without market index we cannot subscribe; just idle
+                return
+            import os
+            from pathlib import Path as _P
+            key_file = _P(os.getenv("LIGHTER_KEY_FILE", str(_P.cwd() / "Lighter_key.txt")))
+            ws_client = LighterWsClient(
+                market_index=market_index,
+                venue_symbol=venue_symbol,
+                account_index=account_index,
+                cache=cache,
+                key_file=key_file,
+                base_url=getattr(connector, "base_url", "https://mainnet.zklighter.elliot.ai"),
+                on_order_update=on_order_update,
+            )
+            await ws_client.start()
+            try:
+                while True:
+                    await asyncio.sleep(3600)
+            finally:
+                await ws_client.stop()
+
+        background_tasks.append(ws_task)
 
     lifecycle = LifecycleController(connector=connector, background_tasks=background_tasks)
     clock = WallClock()
